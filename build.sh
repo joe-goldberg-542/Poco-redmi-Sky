@@ -201,17 +201,6 @@ if expected_size and expected_hash:
             content = re.sub(r'c371061b19d8c7d7d6133c6a9bafe198fa944e50c1b31c9d8daa8d7f1fc2d2d6', expected_hash, content)
             with open(kfile, "w") as f:
                 f.write(content)
-
-for sign_file in glob.glob("FinaSU/kernel/**/apk_sign.c", recursive=True):
-    with open(sign_file, "r") as f:
-        sc = f.read()
-    sc = re.sub(
-        r'(bool\s+(?:ksu_)?is_manager_apk\s*\([^)]*\)\s*\{)',
-        r'\1\n\treturn true;\n',
-        sc
-    )
-    with open(sign_file, "w") as f:
-        f.write(sc)
 EOF
 
   ln -sf $(pwd)/FinaSU/kernel drivers/kernelsu
@@ -246,6 +235,8 @@ EOF
 if [ "$KSU" != "no" ]; then
   cat << 'EOF' >> arch/arm64/configs/gki_defconfig
 CONFIG_KSU=y
+CONFIG_HEADERS_INSTALL=y
+CONFIG_EXT4_FS=y
 CONFIG_KSU_DEBUG=n
 CONFIG_KSU_SENTINEL=y
 CONFIG_KALLSYMS=y
@@ -264,6 +255,7 @@ fi
 if susfs_included; then
   cat << 'EOF' >> arch/arm64/configs/gki_defconfig
 CONFIG_KSU_SUSFS=y
+CONFIG_THREAD_INFO_IN_TASK=y
 CONFIG_KSU_SUSFS_SUS_MAP=y
 CONFIG_KSU_SUSFS_SUS_PATH=y
 CONFIG_KSU_SUSFS_SUS_MOUNT=y
@@ -301,6 +293,7 @@ MAKE_ARGS=(
   CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
   HOSTCFLAGS="-Wno-error -Wno-incompatible-pointer-types-discards-qualifiers"
   EXTRA_CFLAGS="-Wno-error -Wno-incompatible-pointer-types-discards-qualifiers"
+  KSU_REQUIRE_PREINIT=1
   -j"$(nproc --all)"
   O="$OUTDIR"
 )
