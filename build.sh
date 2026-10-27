@@ -86,11 +86,6 @@ if len(dt_check_indices) > 1:
         print("[+] Fixed duplicate dtbs/scripts_dtc/dt_binding_check target recipes in Makefile")
 EOF
 
-# Silence noisy "Value of CONFIG_... is redefined by fragment" messages during config merge
-if [ -f "scripts/kconfig/Makefile" ]; then
-  sed -i 's/merge_config.sh -m/merge_config.sh -m -q/g' scripts/kconfig/Makefile || true
-fi
-
 LINUX_VERSION=$(make kernelversion)
 LINUX_VERSION_CODE=${LINUX_VERSION//./}
 DEFCONFIG_FILE=$(find ./arch/arm64/configs -name "$KERNEL_DEFCONFIG")
