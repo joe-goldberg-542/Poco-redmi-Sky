@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
+if [ -n "${_BUILD_SH_RUNNING:-}" ]; then
+  echo "[-] CRITICAL ERROR: Infinite loop detected! You accidentally pasted build.sh code inside functions.sh!"
+  exit 1
+fi
+export _BUILD_SH_RUNNING=1
+
 WORKDIR="$(pwd)"
 RELEASE_DIR="$WORKDIR/artifacts"
 
@@ -51,7 +57,40 @@ trap 'echo "[-] Received SIGINT at $(date)" >> "$BUILD_LOGS"' INT
 log "Cloning kernel source from $(simplify_gh_url "$KERNEL_REPO")"
 git clone -q --depth=1 "$KERNEL_REPO" -b "$KERNEL_BRANCH" "$KSRC"
 
+# Clean any pre-existing .rej files committed in the upstream kernel repo
+find "$KSRC" -name "*.rej" -type f -delete || true
+
 cd "$KSRC"
+
+# Fix duplicate dtbs / dtbs_install / scripts_dtc / dt_binding_check target warnings in root Makefile
+python3 - << 'EOF'
+with open("Makefile", "r") as f:
+    lines = f.readlines()
+
+dt_check_indices = [i for i, l in enumerate(lines) if l.startswith("dt_binding_check:")]
+if len(dt_check_indices) > 1:
+    first_dt_check = dt_check_indices[0]
+    block_start = None
+    for i in range(first_dt_check, max(-1, first_dt_check - 50), -1):
+        if lines[i].startswith("ifneq ($(dtstree),)"):
+            block_start = i
+            break
+    block_end = first_dt_check
+    while block_end + 1 < len(lines) and lines[block_end + 1].startswith("	"):
+        block_end += 1
+    if block_start is not None:
+        for i in range(block_start, block_end + 1):
+            lines[i] = "# " + lines[i]
+        with open("Makefile", "w") as f:
+            f.writelines(lines)
+        print("[+] Fixed duplicate dtbs/scripts_dtc/dt_binding_check target recipes in Makefile")
+EOF
+
+# Silence noisy "Value of CONFIG_... is redefined by fragment" messages during config merge
+if [ -f "scripts/kconfig/Makefile" ]; then
+  sed -i 's/merge_config.sh -m/merge_config.sh -m -q/g' scripts/kconfig/Makefile || true
+fi
+
 LINUX_VERSION=$(make kernelversion)
 LINUX_VERSION_CODE=${LINUX_VERSION//./}
 DEFCONFIG_FILE=$(find ./arch/arm64/configs -name "$KERNEL_DEFCONFIG")
@@ -78,6 +117,7 @@ SUSFS_PATCH="$SUSFS_BRANCH"
 
 log "Changelog of repos"
 clone_susfs 5
+find "$SUSFS_DIR" -name "*.rej" -type f -delete || true
 cd "$SUSFS_DIR"
 git log --pretty=format:"- [%h](https://${SUSFS_URL#https://}/commit/%H) %s" -5 "$SUSFS_BRANCH" \
   > "$RELEASE_DIR/susfs_changelog-${KERNEL_VERSION}.txt"
@@ -141,6 +181,7 @@ if [ "$KSU" = "FinaSU" ]; then
   sed -i '/kernelsu/d' drivers/Kconfig 2>/dev/null || true
 
   git clone -b dev https://github.com/LyraVoid/FinaSU.git FinaSU
+  find FinaSU -name "*.rej" -type f -delete || true
 
   mkdir -p /tmp/finasu_ci
   ARTIFACT_ID=$(gh api "/repos/LyraVoid/FinaSU/actions/artifacts?name=manager&per_page=10" \
@@ -216,6 +257,7 @@ fi
 if [ "$NM" = "true" ]; then
   log "Applying NoMount (dev)"
   curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh" | bash -s dev
+  find NoMount -name "*.rej" -type f -delete 2>/dev/null || true
   VARIANT+="+NoMount"
 fi
 
@@ -228,53 +270,49 @@ AK3_ZIP_NAME=${AK3_ZIP_NAME//VARIANT/$VARIANT}
 
 log "Applying inline defconfigs..."
 
-cat << 'EOF' >> arch/arm64/configs/gki_defconfig
-CONFIG_RCU_TRACE=n
-EOF
+./scripts/config --file arch/arm64/configs/gki_defconfig -d RCU_TRACE
 
 if [ "$KSU" != "no" ]; then
-  cat << 'EOF' >> arch/arm64/configs/gki_defconfig
-CONFIG_KSU=y
-CONFIG_HEADERS_INSTALL=y
-CONFIG_EXT4_FS=y
-CONFIG_KSU_DEBUG=n
-CONFIG_KSU_SENTINEL=y
-CONFIG_KALLSYMS=y
-CONFIG_KALLSYMS_ALL=y
-CONFIG_KPROBES=y
-CONFIG_HAVE_KPROBES=y
-CONFIG_KPROBE_EVENTS=y
-CONFIG_OVERLAY_FS=y
-EOF
+  ./scripts/config --file arch/arm64/configs/gki_defconfig \
+    -e KSU \
+    -e HEADERS_INSTALL \
+    -e EXT4_FS \
+    -d KSU_DEBUG \
+    -e KSU_SENTINEL \
+    -e KALLSYMS \
+    -e KALLSYMS_ALL \
+    -e KPROBES \
+    -e HAVE_KPROBES \
+    -e KPROBE_EVENTS \
+    -e OVERLAY_FS
 fi
 
 if [ "$NM" = "true" ]; then
-  echo "CONFIG_NOMOUNT=y" >> arch/arm64/configs/gki_defconfig
+  ./scripts/config --file arch/arm64/configs/gki_defconfig -e NOMOUNT
 fi
 
 if susfs_included; then
-  cat << 'EOF' >> arch/arm64/configs/gki_defconfig
-CONFIG_KSU_SUSFS=y
-CONFIG_THREAD_INFO_IN_TASK=y
-CONFIG_KSU_SUSFS_SUS_MAP=y
-CONFIG_KSU_SUSFS_SUS_PATH=y
-CONFIG_KSU_SUSFS_SUS_MOUNT=y
-CONFIG_KSU_SUSFS_SUS_KSTAT=y
-CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-CONFIG_KSU_SUSFS_ENABLE_LOG=y
-CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-CONFIG_KSU_INLINE_HOOK=y
-CONFIG_KSU_SUSFS_SUS_MEMFD=y
-CONFIG_KSU_SUSFS_SUS_PROC_FD_LINK=y
-EOF
+  ./scripts/config --file arch/arm64/configs/gki_defconfig \
+    -e KSU_SUSFS \
+    -e THREAD_INFO_IN_TASK \
+    -e KSU_SUSFS_SUS_MAP \
+    -e KSU_SUSFS_SUS_PATH \
+    -e KSU_SUSFS_SUS_MOUNT \
+    -e KSU_SUSFS_SUS_KSTAT \
+    -e KSU_SUSFS_SPOOF_UNAME \
+    -e KSU_SUSFS_ENABLE_LOG \
+    -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+    -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+    -e KSU_SUSFS_OPEN_REDIRECT \
+    -e KSU_INLINE_HOOK \
+    -e KSU_SUSFS_SUS_MEMFD \
+    -e KSU_SUSFS_SUS_PROC_FD_LINK
 fi
 
 if [ "${TODO:-kernel}" = "kernel" ]; then
   LATEST_COMMIT_HASH=$(git rev-parse --short HEAD)
-  ./scripts/config --file arch/arm64/configs/gki_defconfig --set-str CONFIG_LOCALVERSION "-android15-11-g${LATEST_COMMIT_HASH}"
-  ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_LOCALVERSION_AUTO
+  ./scripts/config --file arch/arm64/configs/gki_defconfig --set-str LOCALVERSION "-android15-11-g${LATEST_COMMIT_HASH}"
+  ./scripts/config --file arch/arm64/configs/gki_defconfig --disable LOCALVERSION_AUTO
   sed -i 's/echo "+"/# echo "+"/g' scripts/setlocalversion
 fi
 
@@ -282,7 +320,8 @@ export KBUILD_BUILD_USER="$USER"
 export KBUILD_BUILD_HOST="$HOST"
 export KBUILD_BUILD_TIMESTAMP=$(git -C "$KSRC" log -1 --format=%cd --date=format-local:'%a %b %d %T %z %Y')
 export KCFLAGS="-w"
-export HOSTCFLAGS="-Wno-error -Wno-incompatible-pointer-types-discards-qualifiers"
+export HOSTCFLAGS="-w -Wno-error -Wno-incompatible-pointer-types-discards-qualifiers -Wno-unused-but-set-global -Wno-unknown-warning-option"
+export KBUILD_HOSTCFLAGS="$HOSTCFLAGS"
 
 LINKER_SHIM="$WORKDIR/clang-lto-linker"
 MAKE_ARGS=(
@@ -291,8 +330,8 @@ MAKE_ARGS=(
   ARCH=arm64
   CROSS_COMPILE=aarch64-linux-gnu-
   CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-  HOSTCFLAGS="-Wno-error -Wno-incompatible-pointer-types-discards-qualifiers"
-  EXTRA_CFLAGS="-Wno-error -Wno-incompatible-pointer-types-discards-qualifiers"
+  HOSTCFLAGS="$HOSTCFLAGS"
+  EXTRA_CFLAGS="-w -Wno-error -Wno-incompatible-pointer-types-discards-qualifiers"
   KSU_REQUIRE_PREINIT=1
   -j"$(nproc --all)"
   O="$OUTDIR"
@@ -322,13 +361,13 @@ fi
 
 log "Injecting LTO Method: ${LTO:-full}"
 if [ "${LTO:-full}" = "full" ]; then
-  ./scripts/config --file "$OUTDIR/.config" -d LTO_CLANG_THIN -e LTO_CLANG_FULL
+  ./scripts/config --file "$OUTDIR/.config" -d LTO_NONE -d LTO_CLANG_THIN -e LTO_CLANG_FULL
   MAKE_ARGS+=(LTO=full)
 elif [ "${LTO:-full}" = "thin" ]; then
-  ./scripts/config --file "$OUTDIR/.config" -e LTO_CLANG_THIN -d LTO_CLANG_FULL
+  ./scripts/config --file "$OUTDIR/.config" -d LTO_NONE -e LTO_CLANG_THIN -d LTO_CLANG_FULL
   MAKE_ARGS+=(LTO=thin)
 elif [ "${LTO:-full}" = "none" ]; then
-  ./scripts/config --file "$OUTDIR/.config" -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE
+  ./scripts/config --file "$OUTDIR/.config" -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL
   MAKE_ARGS+=(LTO=none)
 fi
 make "${MAKE_ARGS[@]}" olddefconfig > /dev/null
