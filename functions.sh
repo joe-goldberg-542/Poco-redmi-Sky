@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-[ -n "${_FUNCTIONS_SH_LOADED:-}" ] && return 0
-_FUNCTIONS_SH_LOADED=1
 
 resolve_kernel_source() {
   echo "https://github.com/xiaomi-ravelin/android_kernel_xiaomi_sm4450|lineage-24.0|android15-6.6"
@@ -128,10 +126,9 @@ build_and_install_pahole() {
     mkdir -p "$bin_dir"
 
     if command -v apt-get >/dev/null 2>&1; then
-        if dpkg -s dwarves &>/dev/null || dpkg -s pahole &>/dev/null; then
-            sudo apt-get remove -y --purge dwarves pahole 2>/dev/null || true
-            hash -r
-        fi
+        sudo apt-get remove -y --purge dwarves pahole 2>/dev/null || true
+        sudo apt-get autoremove -y 2>/dev/null || true
+        hash -r
     fi
 
     local missing=()
@@ -142,7 +139,7 @@ build_and_install_pahole() {
     done
     if (( ${#missing[@]} )); then
         sudo apt-get update -qq
-        sudo apt-get install -y -qq --no-install-recommends "${missing[@]}" || {
+        sudo apt-get install -y -qq "${missing[@]}" || {
             error "failed to install build deps: ${missing[*]}"
             return 1
         }
@@ -169,7 +166,7 @@ build_and_install_pahole() {
         -DCMAKE_INSTALL_PREFIX="$install_prefix" \
         -DCMAKE_INSTALL_RPATH="$lib_dir" \
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-        -DCMAKE_C_FLAGS="-w" \
+        -D__LIB=lib \
         .. || {
         error "cmake failed"
         cd "$start_dir"
@@ -204,7 +201,7 @@ apply_susfs_patches() {
     log "Applying SUSFS patches"
     cp -R $SUSFS_PATCHES/fs/* ./fs
     cp -R $SUSFS_PATCHES/include/linux/* ./include/linux/
-    patch -p1 --fuzz=3 --no-backup-if-mismatch < "$SUSFS_PATCHES/50_add_susfs_in_${SUSFS_PATCH}.patch"
+    patch -p1 --fuzz=3 < "$SUSFS_PATCHES/50_add_susfs_in_${SUSFS_PATCH}.patch"
     
     SUSFS_VERSION=$(grep -E '^#define SUSFS_VERSION' ./include/linux/susfs.h | cut -d' ' -f3 | sed 's/"//g')
     echo "SUSFS_VERSION=$SUSFS_VERSION" >> $GITHUB_ENV
