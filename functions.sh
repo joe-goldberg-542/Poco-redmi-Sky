@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 
 resolve_kernel_source() {
-  echo "https://github.com/xiaomi-ravelin/android_kernel_xiaomi_sm4450|lineage-24.0|android15-6.6"
+  echo "https://github.com/suvojeet-sengupta/android_kernel_xiaomi_sm4450|lineage-24.0|android15-6.6"
 }
-
 resolve_susfs_branch() {
   echo "gki-android15-6.6"
 }
@@ -202,6 +201,7 @@ apply_susfs_patches() {
     cp -R $SUSFS_PATCHES/fs/* ./fs
     cp -R $SUSFS_PATCHES/include/linux/* ./include/linux/
     patch -p1 --fuzz=3 < "$SUSFS_PATCHES/50_add_susfs_in_${SUSFS_PATCH}.patch"
+    echo "CFLAGS_susfs.o += -Wno-unused-function" >> ./fs/Makefile
     
     SUSFS_VERSION=$(grep -E '^#define SUSFS_VERSION' ./include/linux/susfs.h | cut -d' ' -f3 | sed 's/"//g')
     echo "SUSFS_VERSION=$SUSFS_VERSION" >> $GITHUB_ENV
