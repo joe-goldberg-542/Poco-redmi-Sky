@@ -92,6 +92,7 @@ CLANG_BIN="$WORKDIR/neutron-clang/bin"
 mkdir -p "$WORKDIR/neutron-clang"
 cd "$WORKDIR/neutron-clang"
 bash <(curl -s "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman") -S
+bash <(curl -s "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman") --patch=glibc
 cd "$WORKDIR"
 if [ ! -d "$CLANG_BIN" ]; then
   error "Clang not found in ${CLANG_BIN}."
@@ -117,6 +118,8 @@ echo "::group::[+] Applied patches"
 
 export DROIDSPACES="false"
 export NH="false"
+KSU_EXPECTED_SIZE=""
+KSU_EXPECTED_HASH=""
 
 cleanup_abi_gki_protected_exports
 
@@ -134,13 +137,17 @@ if [ -d "kernel/sched/walt" ]; then
 fi
 
 if [ "$KSU" = "FinaSU" ]; then
-  log "FinaSU Integration (Exact as reference build.yml)..."
+  log "FinaSU Integration (Official setup.sh method)..."
 
   rm -rf KernelSU FinaSU drivers/kernelsu
   sed -i '/kernelsu/d' drivers/Makefile 2>/dev/null || true
   sed -i '/kernelsu/d' drivers/Kconfig 2>/dev/null || true
 
   git clone -b dev https://github.com/LyraVoid/FinaSU.git FinaSU
+
+  # Official FinaSU integration script
+  chmod +x ./FinaSU/kernel/setup.sh
+  ./FinaSU/kernel/setup.sh --dir "$(pwd)/FinaSU"
 
   mkdir -p /tmp/finasu_ci
   ARTIFACT_ID=$(gh api "/repos/LyraVoid/FinaSU/actions/artifacts?name=manager&per_page=10" \
@@ -161,8 +168,8 @@ if [ "$KSU" = "FinaSU" ]; then
     export APK_TO_SYNC=""
   fi
 
-  python3 - << 'EOF'
-import os, re, struct, hashlib, glob
+  eval "$(python3 - << 'EOF'
+import os, struct, hashlib
 
 apk_path = os.environ.get("APK_TO_SYNC", "")
 expected_size = None
@@ -192,20 +199,14 @@ if apk_path and os.path.exists(apk_path):
                 pos += 8 + pair_len
 
 if expected_size and expected_hash:
-    print(f"Syncing FinaSU CI APK Signature -> size: {expected_size}, hash: {expected_hash}")
-    for kfile in glob.glob("FinaSU/kernel/**/Kbuild", recursive=True) + glob.glob("FinaSU/kernel/**/Makefile", recursive=True):
-        if os.path.exists(kfile):
-            with open(kfile, "r") as f:
-                content = f.read()
-            content = re.sub(r'0x0*33b', expected_size, content)
-            content = re.sub(r'c371061b19d8c7d7d6133c6a9bafe198fa944e50c1b31c9d8daa8d7f1fc2d2d6', expected_hash, content)
-            with open(kfile, "w") as f:
-                f.write(content)
+    print(f'export KSU_EXPECTED_SIZE="{expected_size}"')
+    print(f'export KSU_EXPECTED_HASH="{expected_hash}"')
 EOF
+)"
 
-  ln -sf $(pwd)/FinaSU/kernel drivers/kernelsu
-  echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-  sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+  if [ -n "$KSU_EXPECTED_SIZE" ] && [ -n "$KSU_EXPECTED_HASH" ]; then
+    log "Synced FinaSU CI APK Signature -> size: $KSU_EXPECTED_SIZE, hash: $KSU_EXPECTED_HASH"
+  fi
 
   if susfs_included; then
     clone_susfs
@@ -237,8 +238,6 @@ if [ "$KSU" != "no" ]; then
 CONFIG_KSU=y
 CONFIG_HEADERS_INSTALL=y
 CONFIG_EXT4_FS=y
-CONFIG_KSU_DEBUG=n
-CONFIG_KSU_SENTINEL=y
 CONFIG_KALLSYMS=y
 CONFIG_KALLSYMS_ALL=y
 CONFIG_KPROBES=y
@@ -256,6 +255,7 @@ if susfs_included; then
   cat << 'EOF' >> arch/arm64/configs/gki_defconfig
 CONFIG_KSU_SUSFS=y
 CONFIG_THREAD_INFO_IN_TASK=y
+CONFIG_KSU_HOOK_SUSFS_INLINE=y
 CONFIG_KSU_SUSFS_SUS_MAP=y
 CONFIG_KSU_SUSFS_SUS_PATH=y
 CONFIG_KSU_SUSFS_SUS_MOUNT=y
@@ -265,7 +265,6 @@ CONFIG_KSU_SUSFS_ENABLE_LOG=y
 CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
 CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
 CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-CONFIG_KSU_INLINE_HOOK=y
 CONFIG_KSU_SUSFS_SUS_MEMFD=y
 CONFIG_KSU_SUSFS_SUS_PROC_FD_LINK=y
 EOF
@@ -293,10 +292,16 @@ MAKE_ARGS=(
   CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
   HOSTCFLAGS="-Wno-error -Wno-incompatible-pointer-types-discards-qualifiers"
   EXTRA_CFLAGS="-Wno-error -Wno-incompatible-pointer-types-discards-qualifiers"
-  KSU_REQUIRE_PREINIT=1
   -j"$(nproc --all)"
   O="$OUTDIR"
 )
+
+if [ -n "$KSU_EXPECTED_SIZE" ] && [ -n "$KSU_EXPECTED_HASH" ]; then
+  MAKE_ARGS+=(
+    "KSU_EXPECTED_SIZE=$KSU_EXPECTED_SIZE"
+    "KSU_EXPECTED_HASH=$KSU_EXPECTED_HASH"
+  )
+fi
 
 if [ "${LTO:-full}" = "thin" ]; then
   log "ThinLTO enabled (Cache removed)"
@@ -332,6 +337,13 @@ elif [ "${LTO:-full}" = "none" ]; then
   MAKE_ARGS+=(LTO=none)
 fi
 make "${MAKE_ARGS[@]}" olddefconfig > /dev/null
+
+# Generate target UAPI headers in $(OUTDIR)/usr/include before enabling KSU_REQUIRE_PREINIT=1
+if [ "$KSU" = "FinaSU" ]; then
+  log "Installing target UAPI headers for FinaSU preinit..."
+  make "${MAKE_ARGS[@]}" headers_install
+  MAKE_ARGS+=(KSU_REQUIRE_PREINIT=1)
+fi
 echo "::endgroup::"
 
 if susfs_included; then
@@ -341,6 +353,7 @@ if susfs_included; then
 
   log "DEBUG: Checking .config for SUSFS"
   grep CONFIG_KSU_SUSFS "$OUTDIR/.config" || error "SUSFS NOT ENABLED in .config!"
+  grep CONFIG_KSU_HOOK_SUSFS_INLINE "$OUTDIR/.config" || error "CONFIG_KSU_HOOK_SUSFS_INLINE NOT ENABLED in .config!"
   grep CONFIG_KSU_SUSFS_SUS_MAP "$OUTDIR/.config" || error "SUSFS_SUS_MAP not enabled!"
   echo ""
 
