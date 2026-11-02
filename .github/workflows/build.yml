@@ -131,7 +131,7 @@ jobs:
       - name: Repack and Sign Boot Image
         if: github.event.inputs.TODO != 'defconfig' && github.event.inputs.TEST == 'no'
         env:
-          BOOT_IMG_URL: "https://www.dropbox.com/scl/fi/lz88o798gu5ae9tolprfu/Aospaboot.img?rlkey=lz4jq3olbv7riqrvixd0qq0w3&st=7ear88p0&dl=1"
+          BOOT_IMG_URL: "https://www.dropbox.com/scl/fi/doe161ejsyt8m5v79j9ge/Aospaboot.img?rlkey=5ssh9f7hyuotl3ch8t2cdokrz&st=gchy0xwm&dl=1"
         shell: bash
         run: |
           echo "::group::[*] Repacking and Signing Boot Image"
