@@ -128,7 +128,6 @@ if [ "$KSU" = "FinaSU" ]; then
 
   git clone -b dev https://github.com/LyraVoid/FinaSU.git FinaSU
 
-  # Official FinaSU integration script
   chmod +x ./FinaSU/kernel/setup.sh
   ./FinaSU/kernel/setup.sh --dir "$(pwd)/FinaSU"
 
@@ -295,6 +294,7 @@ if [ -f "arch/arm64/configs/vendor/parrot_perf.config" ]; then
   log "Cleaning Suvkernel name and disabling WALT from vendor/parrot_perf.config"
   sed -i '/CONFIG_LOCALVERSION/d' arch/arm64/configs/vendor/parrot_perf.config
   sed -i '/CONFIG_SCHED_WALT/d' arch/arm64/configs/vendor/parrot_perf.config
+  sed -i '/CONFIG_QCOM_HUNG_TASK_ENH/d' arch/arm64/configs/vendor/parrot_perf.config
 
   log "Merging gki_defconfig + vendor/parrot_perf.config for POCO M6 Pro 5G (Sky)"
   make "${MAKE_ARGS[@]}" "$KERNEL_DEFCONFIG" vendor/parrot_perf.config
@@ -311,6 +311,7 @@ LATEST_COMMIT_HASH=$(git rev-parse --short=12 HEAD)
   -d CPU_FREQ_DEFAULT_GOV_POWERSAVE \
   -d SCHED_WALT \
   -d SCHED_WALT_DEBUG \
+  -d QCOM_HUNG_TASK_ENH \
   -e CRYPTO_LZ4 \
   --set-str ZRAM_DEF_COMP "lz4" \
   --set-str CONFIG_LOCALVERSION "-android15-11-g${LATEST_COMMIT_HASH}" \
@@ -318,9 +319,19 @@ LATEST_COMMIT_HASH=$(git rev-parse --short=12 HEAD)
 
 sed -i 's/CONFIG_CMDLINE="/CONFIG_CMDLINE="elevator=none /' "$OUTDIR/.config"
 
+log "Injecting LTO Method: ${LTO:-full}"
+if [ "${LTO:-full}" = "full" ]; then
+  ./scripts/config --file "$OUTDIR/.config" -d LTO_CLANG_THIN -e LTO_CLANG_FULL
+  MAKE_ARGS+=(LTO=full)
+elif [ "${LTO:-full}" = "thin" ]; then
+  ./scripts/config --file "$OUTDIR/.config" -e LTO_CLANG_THIN -d LTO_CLANG_FULL
+  MAKE_ARGS+=(LTO=thin)
+elif [ "${LTO:-full}" = "none" ]; then
+  ./scripts/config --file "$OUTDIR/.config" -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE
+  MAKE_ARGS+=(LTO=none)
+fi
 make "${MAKE_ARGS[@]}" olddefconfig > /dev/null
 
-# Generate target UAPI headers in $(OUTDIR)/usr/include before enabling KSU_REQUIRE_PREINIT=1
 if [ "$KSU" = "FinaSU" ]; then
   log "Installing target UAPI headers for FinaSU preinit..."
   make "${MAKE_ARGS[@]}" headers_install
@@ -426,7 +437,6 @@ on property:sys.boot_completed=1
     write /sys/block/mmcblk0/queue/scheduler none
 EOF
 
-# Update AnyKernel script to automatically parse our custom init modifications for swapping and io
 sed -i '/write_boot;/i \
 insert_line init.rc "init.special.rc" after "import /init.environ.rc" "import /init.special.rc";' anykernel.sh
 
