@@ -291,7 +291,7 @@ MODULE_SYMVERS="$OUTDIR/Module.symvers"
 
 echo "::group::[*] Generating config"
 if [ -f "arch/arm64/configs/vendor/parrot_perf.config" ]; then
-  log "Cleaning Suvkernel name and disabling WALT from vendor/parrot_perf.config"
+  log "Cleaning Suvkernel name and disabling WALT/Hung-Task-Enh from vendor/parrot_perf.config"
   sed -i '/CONFIG_LOCALVERSION/d' arch/arm64/configs/vendor/parrot_perf.config
   sed -i '/CONFIG_SCHED_WALT/d' arch/arm64/configs/vendor/parrot_perf.config
   sed -i '/CONFIG_QCOM_HUNG_TASK_ENH/d' arch/arm64/configs/vendor/parrot_perf.config
@@ -332,6 +332,7 @@ elif [ "${LTO:-full}" = "none" ]; then
 fi
 make "${MAKE_ARGS[@]}" olddefconfig > /dev/null
 
+# Generate target UAPI headers in $(OUTDIR)/usr/include before enabling KSU_REQUIRE_PREINIT=1
 if [ "$KSU" = "FinaSU" ]; then
   log "Installing target UAPI headers for FinaSU preinit..."
   make "${MAKE_ARGS[@]}" headers_install
@@ -384,17 +385,17 @@ if [ -f /mnt/swapfile ]; then
   sudo rm -f /mnt/swapfile
 fi
 
-warning "Creating 15GB swap for Heavy Link-Time Optimization (Full LTO)"
-sudo fallocate -l 15G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=15360 status=none
+warning "Creating 8GB swap for Link-Time Optimization without pushing Action Runner Limits"
+sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
 sudo chmod 600 /swapfile
 sudo mkswap /swapfile
 sudo swapon /swapfile
-success "15GB swap created and activated"
+success "8GB swap created and activated"
 
-sudo sysctl -w vm.swappiness=90
-sudo sysctl -w vm.vfs_cache_pressure=200
-sudo sysctl -w vm.dirty_ratio=5
-sudo sysctl -w vm.dirty_background_ratio=2
+sudo sysctl -w vm.swappiness=50
+sudo sysctl -w vm.vfs_cache_pressure=100
+sudo sysctl -w vm.dirty_ratio=3
+sudo sysctl -w vm.dirty_background_ratio=1
 sudo sysctl -w vm.drop_caches=3
 sudo sysctl -w vm.overcommit_memory=1
 
@@ -426,23 +427,4 @@ if [ ! -f "$KERNEL_IMAGE" ]; then
 fi
 cp "$KERNEL_IMAGE" .
 
-mkdir -p overlay.d
-cat << 'EOF' > overlay.d/init.special.rc
-on property:sys.boot_completed=1
-    write /proc/sys/vm/swappiness 60
-    write /proc/sys/vm/vfs_cache_pressure 100
-    write /sys/block/sda/queue/scheduler none
-    write /sys/block/sdb/queue/scheduler none
-    write /sys/block/sdc/queue/scheduler none
-    write /sys/block/mmcblk0/queue/scheduler none
-EOF
-
-sed -i '/write_boot;/i \
-insert_line init.rc "init.special.rc" after "import /init.environ.rc" "import /init.special.rc";' anykernel.sh
-
-zip -r9 "$WORKDIR/$AK3_ZIP_NAME" ./*
-cd "$WORKDIR"
-
-echo "BASE_NAME=$KERNEL_NAME-$VARIANT" >> "$GITHUB_ENV"
-mkdir -p "$RELEASE_DIR"
-mv "$WORKDIR"/*.zip "$RELEASE_DIR"
+mkd
