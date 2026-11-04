@@ -94,23 +94,6 @@ generate_gh_changelog() {
         > "$output"
 }
 
-cleanup_abi_gki_protected_exports() {
-    local files_found=0
-
-    for path in "android" "."; do
-        if [[ -d "$path" ]] && compgen -G "$path/*protected_exports*" > /dev/null; then
-            rm -rf "$path"/*protected_exports*
-            files_found=1
-        fi
-    done
-
-    if [[ $files_found -eq 0 ]]; then
-        success "No ABI GKI protected exports files found to remove"
-    else
-        success "Removed ABI GKI protected exports file(s)"
-    fi
-}
-
 build_and_install_pahole() {
     local pahole_dir="$HOME/.local/src/pahole"
     local install_prefix="$HOME/.local"
