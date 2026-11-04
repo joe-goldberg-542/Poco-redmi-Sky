@@ -5,8 +5,6 @@ WORKDIR="$(pwd)"
 RELEASE_DIR="$WORKDIR/artifacts"
 
 KERNEL_NAME="sky"
-USER=""
-HOST="sky"
 TIMEZONE="Asia/Damascus"
 ANYKERNEL_REPO="https://github.com/ahmed-alnassif/AK3-GKID"
 
@@ -120,21 +118,6 @@ export DROIDSPACES="false"
 export NH="false"
 KSU_EXPECTED_SIZE=""
 KSU_EXPECTED_HASH=""
-
-cleanup_abi_gki_protected_exports
-
-if [ -d "kernel/sched/walt" ]; then
-  log "Patching WALT governor (Retaining App Launch Boost)"
-  sed -i 's/queue_work(input_boost_wq, &input_boost_work);/\/\* killed schedutil-style \*\//g' kernel/sched/walt/input-boost.c
-  sed -i 's/if (wg_policy->tunables->pl)/if (0)/g' kernel/sched/walt/cpufreq_walt.c
-  sed -i 's/#define DEFAULT_HISPEED_LOAD 90/#define DEFAULT_HISPEED_LOAD 105/g' kernel/sched/walt/cpufreq_walt.c
-  sed -i 's/if (wrq->ed_task)/if (0)/g' kernel/sched/walt/walt.c
-  sed -i 's/if (should_apply_suh_freq_boost(cluster))/if (0)/g' kernel/sched/walt/walt.c
-  sed -i 's/if (wrq->lrb_pipeline_start_time)/if (0)/g' kernel/sched/walt/walt.c
-  sed -i 's/wtg->sched_boost_enable\[BALANCE_BOOST\] = true/wtg->sched_boost_enable\[BALANCE_BOOST\] = false/g' kernel/sched/walt/boost.c
-  sed -i 's/#define DEFAULT_SILVER_RTG_BOOST_FREQ 1000000/#define DEFAULT_SILVER_RTG_BOOST_FREQ 0/g' kernel/sched/walt/cpufreq_walt.c
-  sed -i 's/#define DEFAULT_GOLD_RTG_BOOST_FREQ 768000/#define DEFAULT_GOLD_RTG_BOOST_FREQ 0/g' kernel/sched/walt/cpufreq_walt.c
-fi
 
 if [ "$KSU" = "FinaSU" ]; then
   log "FinaSU Integration (Official setup.sh method)..."
@@ -270,16 +253,6 @@ CONFIG_KSU_SUSFS_SUS_PROC_FD_LINK=y
 EOF
 fi
 
-if [ "${TODO:-kernel}" = "kernel" ]; then
-  LATEST_COMMIT_HASH=$(git rev-parse --short HEAD)
-  ./scripts/config --file arch/arm64/configs/gki_defconfig --set-str CONFIG_LOCALVERSION "-android15-11-g${LATEST_COMMIT_HASH}"
-  ./scripts/config --file arch/arm64/configs/gki_defconfig --disable CONFIG_LOCALVERSION_AUTO
-  sed -i 's/echo "+"/# echo "+"/g' scripts/setlocalversion
-fi
-
-export KBUILD_BUILD_USER="$USER"
-export KBUILD_BUILD_HOST="$HOST"
-export KBUILD_BUILD_TIMESTAMP=$(git -C "$KSRC" log -1 --format=%cd --date=format-local:'%a %b %d %T %z %Y')
 export KCFLAGS="-w"
 export HOSTCFLAGS="-Wno-error -Wno-incompatible-pointer-types-discards-qualifiers"
 
@@ -319,23 +292,32 @@ MODULE_SYMVERS="$OUTDIR/Module.symvers"
 
 echo "::group::[*] Generating config"
 if [ -f "arch/arm64/configs/vendor/parrot_perf.config" ]; then
+  log "Cleaning Suvkernel name and disabling WALT from vendor/parrot_perf.config"
+  sed -i '/CONFIG_LOCALVERSION/d' arch/arm64/configs/vendor/parrot_perf.config
+  sed -i '/CONFIG_SCHED_WALT/d' arch/arm64/configs/vendor/parrot_perf.config
+
   log "Merging gki_defconfig + vendor/parrot_perf.config for POCO M6 Pro 5G (Sky)"
   make "${MAKE_ARGS[@]}" "$KERNEL_DEFCONFIG" vendor/parrot_perf.config
 else
   make "${MAKE_ARGS[@]}" "$KERNEL_DEFCONFIG"
 fi
 
-log "Injecting LTO Method: ${LTO:-full}"
-if [ "${LTO:-full}" = "full" ]; then
-  ./scripts/config --file "$OUTDIR/.config" -d LTO_CLANG_THIN -e LTO_CLANG_FULL
-  MAKE_ARGS+=(LTO=full)
-elif [ "${LTO:-full}" = "thin" ]; then
-  ./scripts/config --file "$OUTDIR/.config" -e LTO_CLANG_THIN -d LTO_CLANG_FULL
-  MAKE_ARGS+=(LTO=thin)
-elif [ "${LTO:-full}" = "none" ]; then
-  ./scripts/config --file "$OUTDIR/.config" -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE
-  MAKE_ARGS+=(LTO=none)
-fi
+log "Setting schedutil, None IO, Lz4 zRAM & Stock GKI Localversion"
+LATEST_COMMIT_HASH=$(git rev-parse --short=12 HEAD)
+./scripts/config --file "$OUTDIR/.config" \
+  -e CPU_FREQ_GOV_SCHEDUTIL \
+  -e CPU_FREQ_DEFAULT_GOV_SCHEDUTIL \
+  -d CPU_FREQ_DEFAULT_GOV_PERFORMANCE \
+  -d CPU_FREQ_DEFAULT_GOV_POWERSAVE \
+  -d SCHED_WALT \
+  -d SCHED_WALT_DEBUG \
+  -e CRYPTO_LZ4 \
+  --set-str ZRAM_DEF_COMP "lz4" \
+  --set-str CONFIG_LOCALVERSION "-android15-11-g${LATEST_COMMIT_HASH}" \
+  -d CONFIG_LOCALVERSION_AUTO
+
+sed -i 's/CONFIG_CMDLINE="/CONFIG_CMDLINE="elevator=none /' "$OUTDIR/.config"
+
 make "${MAKE_ARGS[@]}" olddefconfig > /dev/null
 
 # Generate target UAPI headers in $(OUTDIR)/usr/include before enabling KSU_REQUIRE_PREINIT=1
@@ -426,12 +408,28 @@ sed -i \
   "$WORKDIR/anykernel/anykernel.sh"
 
 cd anykernel
-log "Zipping anykernel"
+log "Zipping anykernel and creating Enforcer Init.rc"
 if [ ! -f "$KERNEL_IMAGE" ]; then
   error "$KERNEL_IMAGE not found."
   exit 1
 fi
 cp "$KERNEL_IMAGE" .
+
+mkdir -p overlay.d
+cat << 'EOF' > overlay.d/init.special.rc
+on property:sys.boot_completed=1
+    write /proc/sys/vm/swappiness 60
+    write /proc/sys/vm/vfs_cache_pressure 100
+    write /sys/block/sda/queue/scheduler none
+    write /sys/block/sdb/queue/scheduler none
+    write /sys/block/sdc/queue/scheduler none
+    write /sys/block/mmcblk0/queue/scheduler none
+EOF
+
+# Update AnyKernel script to automatically parse our custom init modifications for swapping and io
+sed -i '/write_boot;/i \
+insert_line init.rc "init.special.rc" after "import /init.environ.rc" "import /init.special.rc";' anykernel.sh
+
 zip -r9 "$WORKDIR/$AK3_ZIP_NAME" ./*
 cd "$WORKDIR"
 
