@@ -427,4 +427,23 @@ if [ ! -f "$KERNEL_IMAGE" ]; then
 fi
 cp "$KERNEL_IMAGE" .
 
-mkd
+mkdir -p overlay.d
+cat << 'EOF' > overlay.d/init.special.rc
+on property:sys.boot_completed=1
+    write /proc/sys/vm/swappiness 60
+    write /proc/sys/vm/vfs_cache_pressure 100
+    write /sys/block/sda/queue/scheduler none
+    write /sys/block/sdb/queue/scheduler none
+    write /sys/block/sdc/queue/scheduler none
+    write /sys/block/mmcblk0/queue/scheduler none
+EOF
+
+sed -i '/write_boot;/i \
+insert_line init.rc "init.special.rc" after "import /init.environ.rc" "import /init.special.rc";' anykernel.sh
+
+zip -r9 "$WORKDIR/$AK3_ZIP_NAME" ./*
+cd "$WORKDIR"
+
+echo "BASE_NAME=$KERNEL_NAME-$VARIANT" >> "$GITHUB_ENV"
+mkdir -p "$RELEASE_DIR"
+mv "$WORKDIR"/*.zip "$RELEASE_DIR"
