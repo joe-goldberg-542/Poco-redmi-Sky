@@ -128,6 +128,7 @@ if [ "$KSU" = "FinaSU" ]; then
 
   git clone -b dev https://github.com/LyraVoid/FinaSU.git FinaSU
 
+  # Official FinaSU integration script
   chmod +x ./FinaSU/kernel/setup.sh
   ./FinaSU/kernel/setup.sh --dir "$(pwd)/FinaSU"
 
@@ -291,10 +292,9 @@ MODULE_SYMVERS="$OUTDIR/Module.symvers"
 
 echo "::group::[*] Generating config"
 if [ -f "arch/arm64/configs/vendor/parrot_perf.config" ]; then
-  log "Cleaning Suvkernel name and disabling WALT/Hung-Task-Enh from vendor/parrot_perf.config"
+  log "Cleaning Suvkernel name from vendor/parrot_perf.config"
   sed -i '/CONFIG_LOCALVERSION/d' arch/arm64/configs/vendor/parrot_perf.config
-  sed -i '/CONFIG_SCHED_WALT/d' arch/arm64/configs/vendor/parrot_perf.config
-  sed -i '/CONFIG_QCOM_HUNG_TASK_ENH/d' arch/arm64/configs/vendor/parrot_perf.config
+  # Yahan WALT abhi delete nahi kiya gaya hai, isliye wo config me mojud rahega.
 
   log "Merging gki_defconfig + vendor/parrot_perf.config for POCO M6 Pro 5G (Sky)"
   make "${MAKE_ARGS[@]}" "$KERNEL_DEFCONFIG" vendor/parrot_perf.config
@@ -302,16 +302,14 @@ else
   make "${MAKE_ARGS[@]}" "$KERNEL_DEFCONFIG"
 fi
 
-log "Setting schedutil, None IO, Lz4 zRAM & Stock GKI Localversion"
+log "Setting schedutil (Default), WALT Kept Alive, None IO, Lz4 zRAM & Stock GKI Localversion"
 LATEST_COMMIT_HASH=$(git rev-parse --short=12 HEAD)
 ./scripts/config --file "$OUTDIR/.config" \
   -e CPU_FREQ_GOV_SCHEDUTIL \
   -e CPU_FREQ_DEFAULT_GOV_SCHEDUTIL \
   -d CPU_FREQ_DEFAULT_GOV_PERFORMANCE \
   -d CPU_FREQ_DEFAULT_GOV_POWERSAVE \
-  -d SCHED_WALT \
-  -d SCHED_WALT_DEBUG \
-  -d QCOM_HUNG_TASK_ENH \
+  -d CPU_FREQ_DEFAULT_GOV_WALT \
   -e CRYPTO_LZ4 \
   --set-str ZRAM_DEF_COMP "lz4" \
   --set-str CONFIG_LOCALVERSION "-android15-11-g${LATEST_COMMIT_HASH}" \
@@ -319,17 +317,6 @@ LATEST_COMMIT_HASH=$(git rev-parse --short=12 HEAD)
 
 sed -i 's/CONFIG_CMDLINE="/CONFIG_CMDLINE="elevator=none /' "$OUTDIR/.config"
 
-log "Injecting LTO Method: ${LTO:-full}"
-if [ "${LTO:-full}" = "full" ]; then
-  ./scripts/config --file "$OUTDIR/.config" -d LTO_CLANG_THIN -e LTO_CLANG_FULL
-  MAKE_ARGS+=(LTO=full)
-elif [ "${LTO:-full}" = "thin" ]; then
-  ./scripts/config --file "$OUTDIR/.config" -e LTO_CLANG_THIN -d LTO_CLANG_FULL
-  MAKE_ARGS+=(LTO=thin)
-elif [ "${LTO:-full}" = "none" ]; then
-  ./scripts/config --file "$OUTDIR/.config" -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE
-  MAKE_ARGS+=(LTO=none)
-fi
 make "${MAKE_ARGS[@]}" olddefconfig > /dev/null
 
 # Generate target UAPI headers in $(OUTDIR)/usr/include before enabling KSU_REQUIRE_PREINIT=1
@@ -385,17 +372,17 @@ if [ -f /mnt/swapfile ]; then
   sudo rm -f /mnt/swapfile
 fi
 
-warning "Creating 8GB swap for Link-Time Optimization without pushing Action Runner Limits"
-sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
+warning "Creating 15GB swap for Heavy Link-Time Optimization (Full LTO)"
+sudo fallocate -l 15G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=15360 status=none
 sudo chmod 600 /swapfile
 sudo mkswap /swapfile
 sudo swapon /swapfile
-success "8GB swap created and activated"
+success "15GB swap created and activated"
 
-sudo sysctl -w vm.swappiness=50
-sudo sysctl -w vm.vfs_cache_pressure=100
-sudo sysctl -w vm.dirty_ratio=3
-sudo sysctl -w vm.dirty_background_ratio=1
+sudo sysctl -w vm.swappiness=90
+sudo sysctl -w vm.vfs_cache_pressure=200
+sudo sysctl -w vm.dirty_ratio=5
+sudo sysctl -w vm.dirty_background_ratio=2
 sudo sysctl -w vm.drop_caches=3
 sudo sysctl -w vm.overcommit_memory=1
 
@@ -438,6 +425,7 @@ on property:sys.boot_completed=1
     write /sys/block/mmcblk0/queue/scheduler none
 EOF
 
+# Update AnyKernel script to automatically parse our custom init modifications for swapping and io
 sed -i '/write_boot;/i \
 insert_line init.rc "init.special.rc" after "import /init.environ.rc" "import /init.special.rc";' anykernel.sh
 
