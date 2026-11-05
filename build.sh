@@ -56,10 +56,14 @@ DEFCONFIG_FILE=$(find ./arch/arm64/configs -name "$KERNEL_DEFCONFIG")
 echo "LINUX_VERSION=$LINUX_VERSION" >> "$GITHUB_ENV"
 cd "$WORKDIR"
 
+# Normalize legacy FinaSU matrix value to Official KSU if passed by generate-matrix.py
+if [ "$KSU" = "FinaSU" ]; then
+  KSU="KSU"
+fi
+
 log "Setting Kernel variant"
 case "$KSU" in
   "SKSU") VARIANT="SukiSU-Ultra" ;;
-  "FinaSU") VARIANT="FinaSU" ;;
   "KSU") VARIANT="KernelSU" ;;
   "no") VARIANT="Vanilla" ;;
   "vnlto") VARIANT="Vanilla+NoLTO" ;;
@@ -75,7 +79,7 @@ SUSFS_BRANCH="$(resolve_susfs_branch)"
 SUSFS_PATCH="$SUSFS_BRANCH"
 
 log "Changelog of repos"
-clone_susfs 5
+clone_susfs 50
 cd "$SUSFS_DIR"
 git log --pretty=format:"- [%h](https://${SUSFS_URL#https://}/commit/%H) %s" -5 "$SUSFS_BRANCH" \
   > "$RELEASE_DIR/susfs_changelog-${KERNEL_VERSION}.txt"
@@ -112,94 +116,28 @@ echo "::group::[+] pahole installation"
 build_and_install_pahole
 echo "::endgroup::"
 
-echo "::group::[+] Applied patches"
+echo "::group::[+] Applied patches (Manual Integration)"
 
 export DROIDSPACES="false"
 export NH="false"
-KSU_EXPECTED_SIZE=""
-KSU_EXPECTED_HASH=""
 
-if [ "$KSU" = "FinaSU" ]; then
-  log "FinaSU Integration (Official setup.sh method)..."
+if [ "$KSU" = "KSU" ]; then
+  # 1. Manual Official KernelSU integration
+  integrate_ksu_manual
 
-  rm -rf KernelSU FinaSU drivers/kernelsu
-  sed -i '/kernelsu/d' drivers/Makefile 2>/dev/null || true
-  sed -i '/kernelsu/d' drivers/Kconfig 2>/dev/null || true
-
-  git clone -b dev https://github.com/LyraVoid/FinaSU.git FinaSU
-
-  # Official FinaSU integration script
-  chmod +x ./FinaSU/kernel/setup.sh
-  ./FinaSU/kernel/setup.sh --dir "$(pwd)/FinaSU"
-
-  mkdir -p /tmp/finasu_ci
-  ARTIFACT_ID=$(gh api "/repos/LyraVoid/FinaSU/actions/artifacts?name=manager&per_page=10" \
-    --jq '.artifacts | map(select(.expired == false)) | .[0].id // empty' 2>/dev/null || true)
-
-  if [ -n "$ARTIFACT_ID" ] && gh api "/repos/LyraVoid/FinaSU/actions/artifacts/$ARTIFACT_ID/zip" > /tmp/finasu_ci/artifact.zip 2>/dev/null; then
-    unzip -q -o /tmp/finasu_ci/artifact.zip -d /tmp/finasu_ci/
-  elif curl -fL "https://nightly.link/LyraVoid/FinaSU/workflows/build/dev/manager.zip" -o /tmp/finasu_ci/artifact.zip; then
-    unzip -q -o /tmp/finasu_ci/artifact.zip -d /tmp/finasu_ci/
-  fi
-
-  CI_APK=$(find /tmp/finasu_ci -name "*.apk" | head -n 1)
-  if [ -n "$CI_APK" ] && [ -f "$CI_APK" ]; then
-    log "Found Manager APK: $CI_APK"
-    cp "$CI_APK" "$RELEASE_DIR/FinaSU-Manager.apk"
-    export APK_TO_SYNC="$CI_APK"
-  else
-    export APK_TO_SYNC=""
-  fi
-
-  eval "$(python3 - << 'EOF'
-import os, struct, hashlib
-
-apk_path = os.environ.get("APK_TO_SYNC", "")
-expected_size = None
-expected_hash = None
-
-if apk_path and os.path.exists(apk_path):
-    with open(apk_path, "rb") as f:
-        data = f.read()
-    eocd = data.rfind(b"PK\x05\x06")
-    if eocd != -1:
-        cd_offset = struct.unpack("<I", data[eocd+16:eocd+20])[0]
-        if data[cd_offset-16:cd_offset] == b"APK Sig Block 42":
-            block_size = struct.unpack("<Q", data[cd_offset-24:cd_offset-16])[0]
-            pos = cd_offset - block_size
-            while pos < cd_offset - 24:
-                pair_len = struct.unpack("<Q", data[pos:pos+8])[0]
-                pair_id = struct.unpack("<I", data[pos+8:pos+12])[0]
-                if pair_id in (0x7109871a, 0xf05368c0):
-                    val = data[pos+12:pos+8+pair_len]
-                    digests_len = struct.unpack("<I", val[12:16])[0]
-                    certs_off = 16 + digests_len
-                    cert_len = struct.unpack("<I", val[certs_off+4:certs_off+8])[0]
-                    cert_bytes = val[certs_off+8:certs_off+8+cert_len]
-                    expected_size = f"0x{cert_len:04x}"
-                    expected_hash = hashlib.sha256(cert_bytes).hexdigest()
-                    break
-                pos += 8 + pair_len
-
-if expected_size and expected_hash:
-    print(f'export KSU_EXPECTED_SIZE="{expected_size}"')
-    print(f'export KSU_EXPECTED_HASH="{expected_hash}"')
-EOF
-)"
-
-  if [ -n "$KSU_EXPECTED_SIZE" ] && [ -n "$KSU_EXPECTED_HASH" ]; then
-    log "Synced FinaSU CI APK Signature -> size: $KSU_EXPECTED_SIZE, hash: $KSU_EXPECTED_HASH"
-  fi
-
+  # 2. Manual SUSFS integration (if enabled)
   if susfs_included; then
-    clone_susfs
-    apply_susfs_patches
+    clone_susfs 50
+    apply_susfs_patches_manual
+  else
+    # If building Official KernelSU without SUSFS, apply manual C hooks
+    apply_ksu_manual_hooks
   fi
 fi
 
+# 3. Manual NoMount integration (Method 3)
 if [ "$NM" = "true" ]; then
-  log "Applying NoMount (dev)"
-  curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh" | bash -s dev
+  integrate_nomount_manual "dev"
   VARIANT+="+NoMount"
 fi
 
@@ -223,11 +161,13 @@ CONFIG_HEADERS_INSTALL=y
 CONFIG_EXT4_FS=y
 CONFIG_KALLSYMS=y
 CONFIG_KALLSYMS_ALL=y
-CONFIG_KPROBES=y
-CONFIG_HAVE_KPROBES=y
-CONFIG_KPROBE_EVENTS=y
 CONFIG_OVERLAY_FS=y
 EOF
+  # Per KernelSU manual integration docs: if manual hooks are used without SUSFS,
+  # disable KPROBES so Safe Mode isn't triggered accidentally after boot.
+  if ! susfs_included; then
+    echo "CONFIG_KPROBES=n" >> arch/arm64/configs/gki_defconfig
+  fi
 fi
 
 if [ "$NM" = "true" ]; then
@@ -238,19 +178,18 @@ if susfs_included; then
   cat << 'EOF' >> arch/arm64/configs/gki_defconfig
 CONFIG_KSU_SUSFS=y
 CONFIG_THREAD_INFO_IN_TASK=y
-CONFIG_KSU_HOOK_SUSFS_INLINE=y
 CONFIG_KSU_SUSFS_SUS_MAP=y
 CONFIG_KSU_SUSFS_SUS_PATH=y
 CONFIG_KSU_SUSFS_SUS_MOUNT=y
 CONFIG_KSU_SUSFS_SUS_KSTAT=y
 CONFIG_KSU_SUSFS_SPOOF_UNAME=y
 CONFIG_KSU_SUSFS_ENABLE_LOG=y
-CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y
 CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
 CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
 CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
 CONFIG_KSU_SUSFS_SUS_MEMFD=y
 CONFIG_KSU_SUSFS_SUS_PROC_FD_LINK=y
+CONFIG_KSU_SUSFS_SUS_SU=n
 EOF
 fi
 
@@ -275,13 +214,6 @@ MAKE_ARGS=(
   O="$OUTDIR"
 )
 
-if [ -n "$KSU_EXPECTED_SIZE" ] && [ -n "$KSU_EXPECTED_HASH" ]; then
-  MAKE_ARGS+=(
-    "KSU_EXPECTED_SIZE=$KSU_EXPECTED_SIZE"
-    "KSU_EXPECTED_HASH=$KSU_EXPECTED_HASH"
-  )
-fi
-
 if [ "${LTO:-full}" = "thin" ]; then
   log "ThinLTO enabled (Cache removed)"
   cat > "$LINKER_SHIM" << SHIM
@@ -300,7 +232,6 @@ echo "::group::[*] Generating config"
 if [ -f "arch/arm64/configs/vendor/parrot_perf.config" ]; then
   log "Cleaning Suvkernel name from vendor/parrot_perf.config"
   sed -i '/CONFIG_LOCALVERSION/d' arch/arm64/configs/vendor/parrot_perf.config
-  # Yahan WALT abhi delete nahi kiya gaya hai, isliye wo config me mojud rahega.
 
   log "Merging gki_defconfig + vendor/parrot_perf.config for POCO M6 Pro 5G (Sky)"
   make "${MAKE_ARGS[@]}" "$KERNEL_DEFCONFIG" vendor/parrot_perf.config
@@ -354,13 +285,6 @@ make "${MAKE_ARGS[@]}" olddefconfig > /dev/null
 
 log "DEBUG: Checking .config for LTO"
 grep "CONFIG_LTO" "$OUTDIR/.config" || true
-
-# Generate target UAPI headers in $(OUTDIR)/usr/include before enabling KSU_REQUIRE_PREINIT=1
-if [ "$KSU" = "FinaSU" ]; then
-  log "Installing target UAPI headers for FinaSU preinit..."
-  make "${MAKE_ARGS[@]}" headers_install
-  MAKE_ARGS+=(KSU_REQUIRE_PREINIT=1)
-fi
 echo "::endgroup::"
 
 if susfs_included; then
@@ -370,7 +294,6 @@ if susfs_included; then
 
   log "DEBUG: Checking .config for SUSFS"
   grep CONFIG_KSU_SUSFS "$OUTDIR/.config" || error "SUSFS NOT ENABLED in .config!"
-  grep CONFIG_KSU_HOOK_SUSFS_INLINE "$OUTDIR/.config" || error "CONFIG_KSU_HOOK_SUSFS_INLINE NOT ENABLED in .config!"
   grep CONFIG_KSU_SUSFS_SUS_MAP "$OUTDIR/.config" || error "SUSFS_SUS_MAP not enabled!"
   echo ""
 
@@ -378,6 +301,11 @@ if susfs_included; then
     warning "SUSFS in defconfig but not in .config - checking dependencies..."
     grep "depends on" $(find . -name "Kconfig" -exec grep -l "KSU_SUSFS" {} \;) 2>/dev/null || error "No dependency info found"
   fi
+fi
+
+if [ "$NM" = "true" ]; then
+  log "DEBUG: Checking .config for NoMount"
+  grep "CONFIG_NOMOUNT=y" "$OUTDIR/.config" || error "CONFIG_NOMOUNT NOT ENABLED in .config!"
 fi
 
 if [ "$TEST" = "yes" ]; then
