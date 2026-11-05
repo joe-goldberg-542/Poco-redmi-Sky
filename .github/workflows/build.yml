@@ -37,14 +37,14 @@ on:
         default: false
 
       BUILD_KSU:
-        description: "Build with KernelSU"
-        type: boolean
-        default: false
-
-      BUILD_FINASU:
-        description: "Build with FinaSU (Dev) + SUSFS"
+        description: "Build with Official KernelSU + SUSFS"
         type: boolean
         default: true
+
+      BUILD_FINASU:
+        description: "Build with FinaSU (Legacy toggle)"
+        type: boolean
+        default: false
 
       DROIDSPACES:
         description: "Enable droidspaces-oss support"
