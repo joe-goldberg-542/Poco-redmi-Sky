@@ -26,12 +26,9 @@ BUILD_CONFIGS: Dict[str, List[Dict[str, Any]]] = {
 		config(name="Vanilla+NoLTO", KSU="vnlto")
 	],
 	"BUILD_KSU": [
-		config(name="KSU", KSU="KSU")
-	],
-	"BUILD_FINASU": [
 		config(
-			name="FinaSU+SUSFS",
-			KSU="FinaSU",
+			name="KSU+SUSFS",
+			KSU="KSU",
 			KSU_SUSFS="true"
 		)
 	]
