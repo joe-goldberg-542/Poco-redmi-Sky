@@ -216,7 +216,7 @@ cat << 'EOF' >> arch/arm64/configs/gki_defconfig
 CONFIG_RCU_TRACE=n
 EOF
 
-if [ "$KSU" != "no" ]; then
+if [ "$KSU" != "no" ] && [ "$KSU" != "vnlto" ]; then
   cat << 'EOF' >> arch/arm64/configs/gki_defconfig
 CONFIG_KSU=y
 CONFIG_HEADERS_INSTALL=y
@@ -256,6 +256,11 @@ fi
 
 export KCFLAGS="-w"
 export HOSTCFLAGS="-Wno-error -Wno-incompatible-pointer-types-discards-qualifiers"
+
+# If KSU variant is explicitly Vanilla+NoLTO, force LTO=none
+if [ "$KSU" = "vnlto" ]; then
+  LTO="none"
+fi
 
 LINKER_SHIM="$WORKDIR/clang-lto-linker"
 MAKE_ARGS=(
@@ -316,9 +321,39 @@ LATEST_COMMIT_HASH=$(git rev-parse --short=12 HEAD)
   --set-str CONFIG_LOCALVERSION "-android15-11-g${LATEST_COMMIT_HASH}" \
   -d CONFIG_LOCALVERSION_AUTO
 
+case "${LTO:-full}" in
+  "full")
+    log "Enabling Full Clang LTO..."
+    ./scripts/config --file "$OUTDIR/.config" \
+      -d LTO_NONE \
+      -d LTO_CLANG_THIN \
+      -e LTO_CLANG \
+      -e LTO_CLANG_FULL
+    ;;
+  "thin")
+    log "Enabling Thin Clang LTO..."
+    ./scripts/config --file "$OUTDIR/.config" \
+      -d LTO_NONE \
+      -d LTO_CLANG_FULL \
+      -e LTO_CLANG \
+      -e LTO_CLANG_THIN
+    ;;
+  "none")
+    log "Disabling LTO..."
+    ./scripts/config --file "$OUTDIR/.config" \
+      -e LTO_NONE \
+      -d LTO_CLANG \
+      -d LTO_CLANG_FULL \
+      -d LTO_CLANG_THIN
+    ;;
+esac
+
 sed -i 's/CONFIG_CMDLINE="/CONFIG_CMDLINE="elevator=none /' "$OUTDIR/.config"
 
 make "${MAKE_ARGS[@]}" olddefconfig > /dev/null
+
+log "DEBUG: Checking .config for LTO"
+grep "CONFIG_LTO" "$OUTDIR/.config" || true
 
 # Generate target UAPI headers in $(OUTDIR)/usr/include before enabling KSU_REQUIRE_PREINIT=1
 if [ "$KSU" = "FinaSU" ]; then
