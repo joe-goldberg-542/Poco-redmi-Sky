@@ -37,14 +37,9 @@ on:
         default: false
 
       BUILD_KSU:
-        description: "Build with Official KernelSU + SUSFS"
+        description: "Build with KernelSU + SUSFS"
         type: boolean
         default: true
-
-      BUILD_FINASU:
-        description: "Build with FinaSU (Legacy toggle)"
-        type: boolean
-        default: false
 
       DROIDSPACES:
         description: "Enable droidspaces-oss support"
@@ -83,7 +78,6 @@ jobs:
           KERNEL_VERSION: "6.6"
           BUILD_VANILLA: ${{ github.event.inputs.BUILD_VANILLA }}
           BUILD_KSU: ${{ github.event.inputs.BUILD_KSU }}
-          BUILD_FINASU: ${{ github.event.inputs.BUILD_FINASU }}
         run: |
           python3 py/generate-matrix.py >> "$GITHUB_OUTPUT"
 
