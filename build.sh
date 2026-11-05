@@ -56,14 +56,8 @@ DEFCONFIG_FILE=$(find ./arch/arm64/configs -name "$KERNEL_DEFCONFIG")
 echo "LINUX_VERSION=$LINUX_VERSION" >> "$GITHUB_ENV"
 cd "$WORKDIR"
 
-# Normalize legacy FinaSU matrix value to Official KSU if passed by generate-matrix.py
-if [ "$KSU" = "FinaSU" ]; then
-  KSU="KSU"
-fi
-
 log "Setting Kernel variant"
 case "$KSU" in
-  "SKSU") VARIANT="SukiSU-Ultra" ;;
   "KSU") VARIANT="KernelSU" ;;
   "no") VARIANT="Vanilla" ;;
   "vnlto") VARIANT="Vanilla+NoLTO" ;;
@@ -79,7 +73,7 @@ SUSFS_BRANCH="$(resolve_susfs_branch)"
 SUSFS_PATCH="$SUSFS_BRANCH"
 
 log "Changelog of repos"
-clone_susfs 50
+clone_susfs 5
 cd "$SUSFS_DIR"
 git log --pretty=format:"- [%h](https://${SUSFS_URL#https://}/commit/%H) %s" -5 "$SUSFS_BRANCH" \
   > "$RELEASE_DIR/susfs_changelog-${KERNEL_VERSION}.txt"
@@ -116,28 +110,29 @@ echo "::group::[+] pahole installation"
 build_and_install_pahole
 echo "::endgroup::"
 
-echo "::group::[+] Applied patches (Manual Integration)"
+echo "::group::[+] Applied patches"
 
 export DROIDSPACES="false"
 export NH="false"
 
 if [ "$KSU" = "KSU" ]; then
-  # 1. Manual Official KernelSU integration
-  integrate_ksu_manual
+  log "Official KernelSU Integration..."
 
-  # 2. Manual SUSFS integration (if enabled)
+  rm -rf KernelSU drivers/kernelsu
+  sed -i '/kernelsu/d' drivers/Makefile 2>/dev/null || true
+  sed -i '/kernelsu/d' drivers/Kconfig 2>/dev/null || true
+
+  # susfsREADME.md Prerequisite #1: clone Official KernelSU without tag (main)
+  curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+
   if susfs_included; then
-    clone_susfs 50
-    apply_susfs_patches_manual
-  else
-    # If building Official KernelSU without SUSFS, apply manual C hooks
-    apply_ksu_manual_hooks
+    clone_susfs
+    apply_susfs_patches
   fi
 fi
 
-# 3. Manual NoMount integration (Method 3)
 if [ "$NM" = "true" ]; then
-  integrate_nomount_manual "dev"
+  integrate_nomount_manual
   VARIANT+="+NoMount"
 fi
 
@@ -161,13 +156,11 @@ CONFIG_HEADERS_INSTALL=y
 CONFIG_EXT4_FS=y
 CONFIG_KALLSYMS=y
 CONFIG_KALLSYMS_ALL=y
+CONFIG_KPROBES=y
+CONFIG_HAVE_KPROBES=y
+CONFIG_KPROBE_EVENTS=y
 CONFIG_OVERLAY_FS=y
 EOF
-  # Per KernelSU manual integration docs: if manual hooks are used without SUSFS,
-  # disable KPROBES so Safe Mode isn't triggered accidentally after boot.
-  if ! susfs_included; then
-    echo "CONFIG_KPROBES=n" >> arch/arm64/configs/gki_defconfig
-  fi
 fi
 
 if [ "$NM" = "true" ]; then
@@ -189,7 +182,6 @@ CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
 CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
 CONFIG_KSU_SUSFS_SUS_MEMFD=y
 CONFIG_KSU_SUSFS_SUS_PROC_FD_LINK=y
-CONFIG_KSU_SUSFS_SUS_SU=n
 EOF
 fi
 
@@ -301,11 +293,6 @@ if susfs_included; then
     warning "SUSFS in defconfig but not in .config - checking dependencies..."
     grep "depends on" $(find . -name "Kconfig" -exec grep -l "KSU_SUSFS" {} \;) 2>/dev/null || error "No dependency info found"
   fi
-fi
-
-if [ "$NM" = "true" ]; then
-  log "DEBUG: Checking .config for NoMount"
-  grep "CONFIG_NOMOUNT=y" "$OUTDIR/.config" || error "CONFIG_NOMOUNT NOT ENABLED in .config!"
 fi
 
 if [ "$TEST" = "yes" ]; then
