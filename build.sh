@@ -121,9 +121,11 @@ if [ "$KSU" = "KSU" ]; then
   if susfs_included; then
     clone_susfs
     apply_susfs_patches
+    apply_selinux_symbol_exports
+  else
+    apply_bakasu_manual_hooks
+    apply_selinux_symbol_exports
   fi
-
-  apply_bakasu_manual_hooks
 fi
 
 if [ "$NM" = "true" ]; then
@@ -147,15 +149,20 @@ EOF
 if [ "$KSU" != "no" ] && [ "$KSU" != "vnlto" ]; then
   cat << 'EOF' >> arch/arm64/configs/gki_defconfig
 CONFIG_KSU=y
-CONFIG_KSU_MANUAL_HOOK=y
-CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
-CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
-CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
 CONFIG_HEADERS_INSTALL=y
 CONFIG_EXT4_FS=y
 CONFIG_KALLSYMS=y
 CONFIG_OVERLAY_FS=y
 EOF
+
+  if ! susfs_included; then
+    cat << 'EOF' >> arch/arm64/configs/gki_defconfig
+CONFIG_KSU_MANUAL_HOOK=y
+CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
+CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
+CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
+EOF
+  fi
 fi
 
 if [ "$NM" = "true" ]; then
@@ -172,11 +179,11 @@ CONFIG_KSU_SUSFS_SUS_MOUNT=y
 CONFIG_KSU_SUSFS_SUS_KSTAT=y
 CONFIG_KSU_SUSFS_SPOOF_UNAME=y
 CONFIG_KSU_SUSFS_ENABLE_LOG=y
-CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y
 CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
 CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
 CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
 CONFIG_KSU_SUSFS_SUS_MEMFD=y
+CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y
 CONFIG_KSU_SUSFS_SUS_PROC_FD_LINK=y
 EOF
 fi
