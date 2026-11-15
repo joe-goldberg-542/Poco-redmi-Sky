@@ -179,6 +179,111 @@ build_and_install_pahole() {
     return 0
 }
 
+integrate_bakasu() {
+    local start_dir
+    start_dir="$(pwd)"
+
+    log "Integrating BakaSU..."
+    rm -rf KernelSU FinaSU BakaSU drivers/kernelsu
+    sed -i '/kernelsu/d' drivers/Makefile 2>/dev/null || true
+    sed -i '/kernelsu/d' drivers/Kconfig 2>/dev/null || true
+
+    curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | command bash -s main
+
+    cd KernelSU
+    command git config --local remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+    command git fetch --quiet origin --prune
+    command git checkout -B main origin/main
+
+    python3 - << 'EOF'
+import json
+import os
+import subprocess
+import time
+import urllib.request
+
+OWNER = "Baka-SU"
+REPO = "BakaSU"
+BASE = "main"
+CUTOFF = int(time.time()) - (90 * 86400)
+TOKEN = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+
+def gh_api(path):
+    url = f"https://api.github.com/repos/{OWNER}/{REPO}{path}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "BakaSU-Merger"
+    }
+    if TOKEN:
+        headers["Authorization"] = f"Bearer {TOKEN}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode())
+
+def run_git(*args):
+    return subprocess.run(["git", *args], capture_output=True, text=True)
+
+drafts = set()
+try:
+    for pr in gh_api("/pulls?state=open&per_page=100"):
+        ref = pr.get("head", {}).get("ref")
+        if ref and pr.get("draft", False):
+            drafts.add(ref)
+except Exception as e:
+    print(f"[WARN] PR fetch error: {e}")
+
+def is_green(sha):
+    try:
+        runs = gh_api(f"/commits/{sha}/check-runs?per_page=100").get("check_runs", [])
+        if not runs:
+            return False
+        ok = False
+        for r in runs:
+            if r.get("status") != "completed":
+                return False
+            c = r.get("conclusion")
+            if c == "success":
+                ok = True
+            elif c not in ("skipped", "neutral"):
+                return False
+        return ok
+    except Exception:
+        return False
+
+fmt = "%(refname:short)|%(objectname)|%(committerdate:unix)"
+refs = run_git(
+    "for-each-ref", "--sort=-committerdate", f"--format={fmt}", "refs/remotes/origin/"
+).stdout.strip().splitlines()
+
+merged = []
+for line in refs:
+    if "|" not in line:
+        continue
+    ref, sha, ts = line.split("|", 2)
+    branch = ref.replace("origin/", "", 1)
+
+    if branch in (BASE, "HEAD") or int(ts) < CUTOFF:
+        continue
+
+    ahead_str = run_git("rev-list", "--count", f"origin/{BASE}..{ref}").stdout.strip()
+    ahead = int(ahead_str) if ahead_str.isdigit() else 0
+    if ahead <= 0 or branch in drafts or not is_green(sha):
+        continue
+
+    res = run_git("merge", "--no-edit", "-m", f"Merge {branch} into {BASE}", ref)
+    if res.returncode == 0:
+        merged.append(branch)
+        print(f"[OK] Merged into {BASE}: {branch} (+{ahead})")
+    else:
+        run_git("merge", "--abort")
+        print(f"[SKIP] Conflict: {branch}")
+
+print(f"Total dynamic branches merged into {BASE}: {len(merged)}")
+EOF
+
+    cd "$start_dir"
+}
+
 clone_susfs() {
     DEPTH=${1:-1}
     if [ ! -d "$SUSFS_DIR" ]; then
@@ -190,49 +295,181 @@ clone_susfs() {
 }
 
 apply_susfs_patches() {
-    log "Applying SUSFS patches (Official susfsREADME.md steps)"
+    log "Applying SUSFS kernel patches"
 
-    # Step 3: Copy 10_enable_susfs_for_ksu.patch to KernelSU
-    cp "$SUSFS_PATCHES/KernelSU/10_enable_susfs_for_ksu.patch" ./KernelSU/
-
-    # Step 4, 5, 6: Copy kernel patch, fs/*, and include/linux/*
     cp "$SUSFS_PATCHES/50_add_susfs_in_${SUSFS_PATCH}.patch" ./
     cp -R "$SUSFS_PATCHES/fs/"* ./fs/
     cp -R "$SUSFS_PATCHES/include/linux/"* ./include/linux/
 
-    # Step 7: Patch KernelSU
-    cd ./KernelSU
-    patch -p1 < 10_enable_susfs_for_ksu.patch
-    cd ..
-
-    # Step 8: Patch Kernel
     patch -p1 --fuzz=3 < "50_add_susfs_in_${SUSFS_PATCH}.patch"
     echo "CFLAGS_susfs.o += -Wno-unused-function" >> ./fs/Makefile
 
-    # Step 11: Delete abi_gki_protected_exports files if present
-    rm -f ./android/abi_gki_protected_exports_aarch64 ./android/abi_gki_protected_exports_x86_64
+    rm -f ./android/abi_gki_protected_exports_aarch64 \
+          ./android/abi_gki_protected_exports_x86_64
 
     SUSFS_VERSION=$(grep -E '^#define SUSFS_VERSION' ./include/linux/susfs.h | cut -d' ' -f3 | sed 's/"//g')
     echo "SUSFS_VERSION=$SUSFS_VERSION" >> "$GITHUB_ENV"
 }
 
+apply_bakasu_manual_hooks() {
+    log "Applying BakaSU manual hooks and SELinux symbol exports"
+
+    python3 - << 'EOF'
+import re
+from pathlib import Path
+
+def patch_file(path_str, fn):
+    p = Path(path_str)
+    if not p.exists():
+        raise SystemExit(f"Missing file: {path_str}")
+    orig = p.read_text()
+    updated = fn(orig)
+    if orig != updated:
+        p.write_text(updated)
+        print(f"[OK] Patched {path_str}")
+
+def patch_stat(s):
+    if "ksu_handle_newfstat_ret" in s:
+        return s
+    ext = (
+        "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+        "__attribute__((hot))\n"
+        "extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n"
+        "\t\t\t\tint *flags);\n\n"
+        "extern void ksu_handle_newfstat_ret(unsigned int *fd, "
+        "struct stat __user **statbuf_ptr);\n"
+        "#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)\n"
+        "extern void ksu_handle_fstat64_ret(unsigned long *fd, "
+        "struct stat64 __user **statbuf_ptr);\n"
+        "#endif\n"
+        "#endif\n\n"
+    )
+    s = re.sub(r'(SYSCALL_DEFINE4\(newfstatat,)', ext + r'\1', s, count=1)
+    s = re.sub(
+        r'(\terror = vfs_fstatat\(dfd, filename, &stat, flag\);)',
+        '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+        '\tksu_handle_stat(&dfd, &filename, &flag);\n'
+        '#endif\n\\1',
+        s
+    )
+    s = re.sub(
+        r'(SYSCALL_DEFINE2\(newfstat,[\s\S]*?cp_new_stat\(&stat, statbuf\);\n)',
+        r'\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+        r'\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif\n',
+        s, count=1
+    )
+    s = re.sub(
+        r'(SYSCALL_DEFINE2\(fstat64,[\s\S]*?cp_new_stat64\(&stat, statbuf\);\n)',
+        r'\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+        r'\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif\n',
+        s, count=1
+    )
+    return s
+
+def patch_exec(s):
+    if "ksu_handle_post_execveat" in s:
+        return s
+    ext = (
+        "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+        "__attribute__((hot))\n"
+        "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n"
+        "\t\t\t\tvoid *argv, void *envp, int *flags);\n"
+        "__attribute__((hot))\n"
+        "extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr,\n"
+        "\t\t\t\tvoid *argv, void *envp, int *flags, int *retval);\n"
+        "#endif\n\n"
+    )
+    s = re.sub(
+        r'(static int do_execveat_common\(int fd, struct filename \*filename,)',
+        ext + r'\1', s, count=1
+    )
+    s = re.sub(
+        r'(static int do_execveat_common\([\s\S]*?)(\tif \(IS_ERR\(filename\)\))',
+        r'\1#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+        r'\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n'
+        r'#endif\n\n\2',
+        s, count=1
+    )
+    s = re.sub(
+        r'(static int do_execveat_common\([\s\S]*?out_ret:\n)',
+        r'\1#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+        r'\tksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);\n'
+        r'#endif\n',
+        s, count=1
+    )
+    return s
+
+def patch_open(s):
+    if "ksu_handle_faccessat" in s:
+        return s
+    ext = (
+        "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+        "__attribute__((hot))\n"
+        "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n"
+        "\t\t\t\tint *mode, int *flags);\n"
+        "#endif\n\n"
+    )
+    return re.sub(
+        r'(SYSCALL_DEFINE3\(faccessat, int, dfd, const char __user \*, filename, int, mode\)\n\{\n)',
+        ext + r'\1#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+        r'\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n',
+        s, count=1
+    )
+
+def patch_reboot(s):
+    if "ksu_handle_sys_reboot" in s:
+        return s
+    ext = (
+        "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+        "extern int ksu_handle_sys_reboot(int magic1, int magic2, "
+        "unsigned int cmd, void __user **arg);\n"
+        "#endif\n\n"
+    )
+    s = re.sub(r'(SYSCALL_DEFINE4\(reboot,)', ext + r'\1', s, count=1)
+    return re.sub(
+        r'(SYSCALL_DEFINE4\(reboot,[\s\S]*?)(\tif \(!ns_capable\(pid_ns->user_ns, CAP_SYS_BOOT\)\))',
+        r'\1#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+        r'\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n\2',
+        s, count=1
+    )
+
+def patch_selinuxfs(s):
+    s = re.sub(
+        r'static\s+(ssize_t\s+\(\*write_op\[\]\)\(struct file \*, char \*, size_t\)\s*=\s*\{)',
+        r'\1', s
+    )
+    return re.sub(
+        r'static\s+(const\s+struct\s+file_operations\s+sel_handle_status_ops\s*=\s*\{)',
+        r'\1', s
+    )
+
+def patch_selinux_services(s):
+    s = re.sub(r'static\s+(void\s+security_dump_masked_av\s*\()', r'\1', s)
+    return re.sub(r'static\s+(void\s+context_struct_compute_av\s*\()', r'\1', s)
+
+patch_file("fs/stat.c", patch_stat)
+patch_file("fs/exec.c", patch_exec)
+patch_file("fs/open.c", patch_open)
+patch_file("kernel/reboot.c", patch_reboot)
+patch_file("security/selinux/selinuxfs.c", patch_selinuxfs)
+patch_file("security/selinux/ss/services.c", patch_selinux_services)
+EOF
+}
+
 integrate_nomount_manual() {
-    log "Applying NoMount (Official NOmountREADME.md Method 3)"
+    log "Applying NoMount"
 
     rm -rf "$WORKDIR/nomount"
     git clone -q --depth=1 -b dev https://github.com/maxsteeel/nomount.git "$WORKDIR/nomount"
 
-    # 1. Add to fs/Kconfig
     if ! grep -q 'source "fs/nomount/Kconfig"' ./fs/Kconfig; then
         sed -i '/endmenu/i source "fs/nomount/Kconfig"' ./fs/Kconfig
     fi
 
-    # 2. Add to fs/Makefile
     if ! grep -q 'CONFIG_NOMOUNT' ./fs/Makefile; then
         echo 'obj-$(CONFIG_NOMOUNT) += nomount/' >> ./fs/Makefile
     fi
 
-    # 3. Copy the necessary files
     mkdir -p ./fs/nomount
     cp -f "$WORKDIR/nomount/kernel/src/"* ./fs/nomount/
 }
