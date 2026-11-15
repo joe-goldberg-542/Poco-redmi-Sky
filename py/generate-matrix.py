@@ -6,7 +6,6 @@ import sys
 from typing import Dict, List, Any
 from copy import deepcopy
 
-# Default template
 DEFAULT = {
 	"name": "Dummy",
 	"KSU": "Dummy",
@@ -14,12 +13,10 @@ DEFAULT = {
 }
 
 def config(**overrides) -> Dict[str, Any]:
-	"""Create config from default with overrides."""
 	cfg = deepcopy(DEFAULT)
 	cfg.update(overrides)
 	return cfg
 
-# Build configurations
 BUILD_CONFIGS: Dict[str, List[Dict[str, Any]]] = {
 	"BUILD_VANILLA": [
 		config(name="Vanilla", KSU="no"),
@@ -37,7 +34,6 @@ BUILD_CONFIGS: Dict[str, List[Dict[str, Any]]] = {
 ALL_KERNEL_VERSIONS: List[str] = ["6.6"]
 
 def get_env_bool(var_name: str, default: bool = False) -> bool:
-	"""Read environment variable as boolean."""
 	value = os.environ.get(var_name, "").strip().lower()
 	if not value:
 		return default
@@ -75,9 +71,7 @@ def main() -> None:
 	try:
 		matrix = generate_matrix()
 		print(f"matrix={json.dumps(matrix)}")
-
 		print(f"::notice::Generated {len(matrix['include'])} build configurations", file=sys.stderr)
-
 	except Exception as e:
 		print(f"::error::Failed to generate matrix: {str(e)}", file=sys.stderr)
 		sys.exit(1)
