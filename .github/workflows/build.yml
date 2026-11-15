@@ -128,7 +128,7 @@ jobs:
       - name: Package Boot Image
         if: github.event.inputs.TODO != 'defconfig' && github.event.inputs.TEST == 'no'
         env:
-          BOOT_IMG_URL: "https://www.dropbox.com/scl/fi/trtdv4bsekbd0clx6b070/Penguinboot.img?rlkey=bbxieqwc0g3satwrmooxkoq17&st=l1nbab6r&dl=1"
+          BOOT_IMG_URL: "https://www.dropbox.com/scl/fi/urvcvox1os6tjpt6btg96/Aospaboot.img?rlkey=ivf9hkuluneilz6bblbnqfce6&st=f9nj6nep&dl=1"
         shell: bash
         run: |
           echo "::group::[*] Packaging Boot Image"
