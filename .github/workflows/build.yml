@@ -1,4 +1,5 @@
-name: kernel Builder
+name: Kernel Builder
+
 permissions:
   contents: write
   actions: write
@@ -15,7 +16,7 @@ on:
           - "defconfig"
 
       TEST:
-        description: debug the pipeline
+        description: Debug the pipeline
         default: "no"
         type: choice
         options:
@@ -23,7 +24,7 @@ on:
           - "yes"
 
       LTO:
-        description: enable LTO optimization
+        description: Enable LTO optimization
         default: "full"
         type: choice
         options:
@@ -37,7 +38,7 @@ on:
         default: false
 
       BUILD_KSU:
-        description: "Build with KernelSU + SUSFS"
+        description: "Build with BakaSU + SUSFS"
         type: boolean
         default: true
 
@@ -67,12 +68,12 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
 
     steps:
-      - name: Checkout source
+      - name: Checkout Repository
         uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 1
 
-      - name: Generate build matrix
+      - name: Generate Build Matrix
         id: set-matrix
         env:
           KERNEL_VERSION: "6.6"
@@ -89,7 +90,7 @@ jobs:
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
-      - name: Checkout source
+      - name: Checkout Repository
         uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 1
@@ -97,10 +98,12 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdw-dev gh bc bison flex libssl-dev libelf-dev cmake zlib1g-dev cpio zip
+          sudo apt-get install -y \
+            libdw-dev gh bc bison flex libssl-dev libelf-dev \
+            cmake zlib1g-dev cpio zip
           pip install lxml
 
-      - name: Run Build Script
+      - name: Compile Kernel
         env:
           GH_TOKEN: ${{ github.token }}
           KERNEL_VERSION: "6.6"
@@ -122,18 +125,21 @@ jobs:
           chmod +x *.sh py/*.py
           ./build.sh
 
-      - name: Repack and Sign Boot Image
+      - name: Package Boot Image
         if: github.event.inputs.TODO != 'defconfig' && github.event.inputs.TEST == 'no'
         env:
           BOOT_IMG_URL: "https://www.dropbox.com/scl/fi/trtdv4bsekbd0clx6b070/Penguinboot.img?rlkey=bbxieqwc0g3satwrmooxkoq17&st=l1nbab6r&dl=1"
         shell: bash
         run: |
-          echo "::group::[*] Repacking and Signing Boot Image"
-          mkdir -p repack/extracted
-          mkdir -p repack/output
+          echo "::group::[*] Packaging Boot Image"
+          mkdir -p repack/extracted repack/output
 
-          git clone -q --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg repack/mkbootimg_tool
-          git clone -q --depth=1 https://android.googlesource.com/platform/external/avb repack/avb_tool
+          git clone -q --depth=1 \
+            https://android.googlesource.com/platform/system/tools/mkbootimg \
+            repack/mkbootimg_tool
+          git clone -q --depth=1 \
+            https://android.googlesource.com/platform/external/avb \
+            repack/avb_tool
 
           curl -L "$BOOT_IMG_URL" -o repack/stock_boot.img
 
@@ -149,7 +155,9 @@ jobs:
              exit 1
           fi
 
-          python3 repack/mkbootimg_tool/unpack_bootimg.py --boot_img repack/stock_boot.img --out repack/extracted > repack/extracted/configs.txt
+          python3 repack/mkbootimg_tool/unpack_bootimg.py \
+            --boot_img repack/stock_boot.img \
+            --out repack/extracted > repack/extracted/configs.txt
 
           python3 - << 'EOF'
           import sys, os, subprocess
@@ -158,35 +166,35 @@ jobs:
           with open("repack/extracted/configs.txt") as f:
               for line in f:
                   if ":" in line:
-                      key, val = line.split(":", 1)
-                      config[key.strip().lower().replace("_", " ")] = val.strip()
+                      k, v = line.split(":", 1)
+                      config[k.strip().lower().replace("_", " ")] = v.strip()
 
-          header_version = config.get("boot image header version") or config.get("header version") or "4"
-          page_size = config.get("page size") or "4096"
-          cmdline = config.get("command line args") or config.get("command line") or config.get("cmdline") or ""
-          board_name = config.get("name") or config.get("board name") or config.get("board") or ""
-          os_version = config.get("os version") or ""
-          os_patch_level = config.get("os patch level") or ""
+          hdr = config.get("boot image header version") or config.get("header version") or "4"
+          page = config.get("page size") or "4096"
+          cmd_args = config.get("command line args") or config.get("command line") or config.get("cmdline") or ""
+          board = config.get("name") or config.get("board name") or config.get("board") or ""
+          os_ver = config.get("os version") or ""
+          os_patch = config.get("os patch level") or ""
 
           cmd = [
               "python3", "repack/mkbootimg_tool/mkbootimg.py",
               "--kernel", os.environ.get("IMAGE_PATH"),
-              "--header_version", str(header_version),
-              "--pagesize", str(page_size),
+              "--header_version", str(hdr),
+              "--pagesize", str(page),
               "--output", "repack/output/boot.img"
           ]
 
-          if cmdline: cmd.extend(["--cmdline", cmdline])
-          if board_name: cmd.extend(["--board", board_name])
-          if os_version and os_version != "None": cmd.extend(["--os_version", os_version])
-          if os_patch_level and os_patch_level != "None": cmd.extend(["--os_patch_level", os_patch_level])
+          if cmd_args: cmd.extend(["--cmdline", cmd_args])
+          if board: cmd.extend(["--board", board])
+          if os_ver and os_ver != "None": cmd.extend(["--os_version", os_ver])
+          if os_patch and os_patch != "None": cmd.extend(["--os_patch_level", os_patch])
 
-          if os.path.exists("repack/extracted/ramdisk"): cmd.extend(["--ramdisk", "repack/extracted/ramdisk"])
-          if os.path.exists("repack/extracted/dtb"): cmd.extend(["--dtb", "repack/extracted/dtb"])
-          if os.path.exists("repack/extracted/dtbo"): cmd.extend(["--dtbo", "repack/extracted/dtbo"])
+          for part in ("ramdisk", "dtb", "dtbo"):
+              p = f"repack/extracted/{part}"
+              if os.path.exists(p):
+                  cmd.extend([f"--{part}", p])
 
-          res = subprocess.run(cmd)
-          if res.returncode != 0:
+          if subprocess.run(cmd).returncode != 0:
               print("::error::mkbootimg repack failed.")
               sys.exit(1)
           EOF
@@ -207,7 +215,7 @@ jobs:
           cp repack/output/boot.img "artifacts/$BOOT_IMG_NAME"
           echo "::endgroup::"
 
-      - name: Save environment for release
+      - name: Save Build Environment
         if: always()
         run: |
           cat > build-env-${{ matrix.name }}.txt << EOF
@@ -228,17 +236,14 @@ jobs:
           EOF
 
           echo "BUILD_VARIANT=${{ matrix.name }}" >> build-env-${{ matrix.name }}.txt
-          echo "Saved environment for ${{ matrix.name }}"
 
           if find . -name "*.rej" -type f | grep -q .; then
             mkdir -p rejected-patches-${{ matrix.name }}
-            find . -name "*.rej" -type f -exec sh -c 'cp "$1" "rejected-patches-${{ matrix.name }}/$(echo "$1" | sed "s|^\./||; s|/|_|g")"' _ {} \;
-            echo "Found $(find rejected-patches-${{ matrix.name }} -type f | wc -l) rejected patch files"
-          else
-            echo "No rejected patches found for ${{ matrix.name }}"
+            find . -name "*.rej" -type f -exec sh -c \
+              'cp "$1" "rejected-patches-${{ matrix.name }}/$(echo "$1" | sed "s|^\./||; s|/|_|g")"' _ {} \;
           fi
 
-      - name: Upload environment file
+      - name: Upload Environment File
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
@@ -248,7 +253,7 @@ jobs:
             rejected-patches-${{ matrix.name }}/
           retention-days: 1
 
-      - name: Upload build artifacts
+      - name: Upload Build Artifacts
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
@@ -261,14 +266,14 @@ jobs:
     if: always()
     runs-on: ubuntu-26.04
     steps:
-      - name: Download all build artifacts
+      - name: Download Build Artifacts
         uses: actions/download-artifact@v8.0.2
         with:
           path: downloaded-artifacts
           pattern: build-*
           merge-multiple: true
 
-      - name: Upload combined artifacts
+      - name: Upload Combined Artifacts
         uses: actions/upload-artifact@v7.0.2
         with:
           name: all-builds-${{ github.run_number }}
@@ -285,12 +290,12 @@ jobs:
     if: success() && github.event.inputs.TODO != 'defconfig' && github.event.inputs.TEST == 'no'
     runs-on: ubuntu-26.04
     steps:
-      - name: Checkout source
+      - name: Checkout Repository
         uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 1
 
-      - name: Download build and env artifacts
+      - name: Download Artifacts
         uses: actions/download-artifact@v8.0.2
         with:
           path: release-artifacts
@@ -309,7 +314,7 @@ jobs:
           sha256sum "${files[@]}" > checksums.txt
           md5sum "${files[@]}" > checksums-md5.txt
 
-      - name: Load environment from builds and prepare release body
+      - name: Prepare Release Body
         env:
           TEST_INPUT: ${{ inputs.TEST }}
           DROIDSPACES_INPUT: ${{ inputs.DROIDSPACES }}
@@ -318,7 +323,7 @@ jobs:
           LTO_INPUT: ${{ inputs.LTO }}
         run: python3 .github/scripts/prepare_release.py
 
-      - name: Upload All Builds to release repo
+      - name: Publish Release
         uses: softprops/action-gh-release@v3.0.3
         env:
           GITHUB_TOKEN: ${{ github.token }}
