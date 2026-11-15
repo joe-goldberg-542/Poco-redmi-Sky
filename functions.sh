@@ -191,6 +191,8 @@ integrate_bakasu() {
     curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | command bash -s main
 
     cd KernelSU
+    command git config user.name "joe-goldberg-542"
+    command git config user.email "joe_goldberg_542@protonmail.com"
     command git config --local remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
     command git fetch --quiet origin --prune
     command git checkout -B main origin/main
@@ -276,7 +278,9 @@ for line in refs:
         print(f"[OK] Merged into {BASE}: {branch} (+{ahead})")
     else:
         run_git("merge", "--abort")
-        print(f"[SKIP] Conflict: {branch}")
+        err_msg = (res.stderr or res.stdout).strip().splitlines()
+        reason = err_msg[-1] if err_msg else "conflict"
+        print(f"[SKIP] {branch}: {reason}")
 
 print(f"Total dynamic branches merged into {BASE}: {len(merged)}")
 EOF
@@ -311,8 +315,44 @@ apply_susfs_patches() {
     echo "SUSFS_VERSION=$SUSFS_VERSION" >> "$GITHUB_ENV"
 }
 
+apply_selinux_symbol_exports() {
+    log "Applying SELinux static symbol exports"
+
+    python3 - << 'EOF'
+import re
+from pathlib import Path
+
+def patch_file(path_str, fn):
+    p = Path(path_str)
+    if not p.exists():
+        raise SystemExit(f"Missing file: {path_str}")
+    orig = p.read_text()
+    updated = fn(orig)
+    if orig != updated:
+        p.write_text(updated)
+        print(f"[OK] Patched {path_str}")
+
+def patch_selinuxfs(s):
+    s = re.sub(
+        r'static\s+(ssize_t\s+\(\*write_op\[\]\)\(struct file \*, char \*, size_t\)\s*=\s*\{)',
+        r'\1', s
+    )
+    return re.sub(
+        r'static\s+(const\s+struct\s+file_operations\s+sel_handle_status_ops\s*=\s*\{)',
+        r'\1', s
+    )
+
+def patch_selinux_services(s):
+    s = re.sub(r'static\s+(void\s+security_dump_masked_av\s*\()', r'\1', s)
+    return re.sub(r'static\s+(void\s+context_struct_compute_av\s*\()', r'\1', s)
+
+patch_file("security/selinux/selinuxfs.c", patch_selinuxfs)
+patch_file("security/selinux/ss/services.c", patch_selinux_services)
+EOF
+}
+
 apply_bakasu_manual_hooks() {
-    log "Applying BakaSU manual hooks and SELinux symbol exports"
+    log "Applying BakaSU manual hooks"
 
     python3 - << 'EOF'
 import re
@@ -433,26 +473,10 @@ def patch_reboot(s):
         s, count=1
     )
 
-def patch_selinuxfs(s):
-    s = re.sub(
-        r'static\s+(ssize_t\s+\(\*write_op\[\]\)\(struct file \*, char \*, size_t\)\s*=\s*\{)',
-        r'\1', s
-    )
-    return re.sub(
-        r'static\s+(const\s+struct\s+file_operations\s+sel_handle_status_ops\s*=\s*\{)',
-        r'\1', s
-    )
-
-def patch_selinux_services(s):
-    s = re.sub(r'static\s+(void\s+security_dump_masked_av\s*\()', r'\1', s)
-    return re.sub(r'static\s+(void\s+context_struct_compute_av\s*\()', r'\1', s)
-
 patch_file("fs/stat.c", patch_stat)
 patch_file("fs/exec.c", patch_exec)
 patch_file("fs/open.c", patch_open)
 patch_file("kernel/reboot.c", patch_reboot)
-patch_file("security/selinux/selinuxfs.c", patch_selinuxfs)
-patch_file("security/selinux/ss/services.c", patch_selinux_services)
 EOF
 }
 
