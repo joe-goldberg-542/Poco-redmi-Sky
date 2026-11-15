@@ -58,7 +58,7 @@ cd "$WORKDIR"
 
 log "Setting Kernel variant"
 case "$KSU" in
-  "KSU") VARIANT="KernelSU" ;;
+  "KSU") VARIANT="BakaSU" ;;
   "no") VARIANT="Vanilla" ;;
   "vnlto") VARIANT="Vanilla+NoLTO" ;;
   *) VARIANT="Vanilla" ;;
@@ -81,7 +81,7 @@ cd "$WORKDIR"
 
 generate_gh_changelog "xiaomi-ravelin/android_kernel_xiaomi_sm4450" "$KERNEL_BRANCH" 10 "$RELEASE_DIR/android_kernel-6.6_changelog.txt"
 generate_gh_changelog "maxsteeel/nomount" "dev" 5 "$RELEASE_DIR/nomount_changelog.txt"
-generate_gh_changelog "tiann/KernelSU" "main" 5 "$RELEASE_DIR/ksu_changelog.txt"
+generate_gh_changelog "Baka-SU/BakaSU" "main" 5 "$RELEASE_DIR/ksu_changelog.txt"
 
 echo "::group::[*] Downloading Clang"
 CLANG_BIN="$WORKDIR/neutron-clang/bin"
@@ -116,19 +116,14 @@ export DROIDSPACES="false"
 export NH="false"
 
 if [ "$KSU" = "KSU" ]; then
-  log "Official KernelSU Integration..."
-
-  rm -rf KernelSU drivers/kernelsu
-  sed -i '/kernelsu/d' drivers/Makefile 2>/dev/null || true
-  sed -i '/kernelsu/d' drivers/Kconfig 2>/dev/null || true
-
-  # susfsREADME.md Prerequisite #1: clone Official KernelSU without tag (main)
-  curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+  integrate_bakasu
 
   if susfs_included; then
     clone_susfs
     apply_susfs_patches
   fi
+
+  apply_bakasu_manual_hooks
 fi
 
 if [ "$NM" = "true" ]; then
@@ -152,13 +147,13 @@ EOF
 if [ "$KSU" != "no" ] && [ "$KSU" != "vnlto" ]; then
   cat << 'EOF' >> arch/arm64/configs/gki_defconfig
 CONFIG_KSU=y
+CONFIG_KSU_MANUAL_HOOK=y
+CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
+CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
+CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
 CONFIG_HEADERS_INSTALL=y
 CONFIG_EXT4_FS=y
 CONFIG_KALLSYMS=y
-CONFIG_KALLSYMS_ALL=y
-CONFIG_KPROBES=y
-CONFIG_HAVE_KPROBES=y
-CONFIG_KPROBE_EVENTS=y
 CONFIG_OVERLAY_FS=y
 EOF
 fi
@@ -188,7 +183,6 @@ fi
 export KCFLAGS="-w"
 export HOSTCFLAGS="-Wno-error -Wno-incompatible-pointer-types-discards-qualifiers"
 
-# If KSU variant is explicitly Vanilla+NoLTO, force LTO=none
 if [ "$KSU" = "vnlto" ]; then
   LTO="none"
 fi
@@ -207,7 +201,7 @@ MAKE_ARGS=(
 )
 
 if [ "${LTO:-full}" = "thin" ]; then
-  log "ThinLTO enabled (Cache removed)"
+  log "ThinLTO enabled"
   cat > "$LINKER_SHIM" << SHIM
 #!/usr/bin/env bash
 JOBCOUNT=\$(( \$(nproc --all) / 2 ))
@@ -222,16 +216,16 @@ MODULE_SYMVERS="$OUTDIR/Module.symvers"
 
 echo "::group::[*] Generating config"
 if [ -f "arch/arm64/configs/vendor/parrot_perf.config" ]; then
-  log "Cleaning Suvkernel name from vendor/parrot_perf.config"
+  log "Cleaning localversion from vendor/parrot_perf.config"
   sed -i '/CONFIG_LOCALVERSION/d' arch/arm64/configs/vendor/parrot_perf.config
 
-  log "Merging gki_defconfig + vendor/parrot_perf.config for POCO M6 Pro 5G (Sky)"
+  log "Merging gki_defconfig + vendor/parrot_perf.config"
   make "${MAKE_ARGS[@]}" "$KERNEL_DEFCONFIG" vendor/parrot_perf.config
 else
   make "${MAKE_ARGS[@]}" "$KERNEL_DEFCONFIG"
 fi
 
-log "Setting schedutil (Default), WALT Kept Alive, None IO, Lz4 zRAM & Stock GKI Localversion"
+log "Configuring governor, zRAM, and localversion"
 LATEST_COMMIT_HASH=$(git rev-parse --short=12 HEAD)
 ./scripts/config --file "$OUTDIR/.config" \
   -e CPU_FREQ_GOV_SCHEDUTIL \
@@ -275,16 +269,16 @@ sed -i 's/CONFIG_CMDLINE="/CONFIG_CMDLINE="elevator=none /' "$OUTDIR/.config"
 
 make "${MAKE_ARGS[@]}" olddefconfig > /dev/null
 
-log "DEBUG: Checking .config for LTO"
+log "Checking .config for LTO"
 grep "CONFIG_LTO" "$OUTDIR/.config" || true
 echo "::endgroup::"
 
 if susfs_included; then
-  log "DEBUG: Checking defconfig for SUSFS"
+  log "Checking defconfig for SUSFS"
   grep -i susfs ./arch/arm64/configs/gki_defconfig || error "SUSFS NOT FOUND in defconfig!"
   echo ""
 
-  log "DEBUG: Checking .config for SUSFS"
+  log "Checking .config for SUSFS"
   grep CONFIG_KSU_SUSFS "$OUTDIR/.config" || error "SUSFS NOT ENABLED in .config!"
   grep CONFIG_KSU_SUSFS_SUS_MAP "$OUTDIR/.config" || error "SUSFS_SUS_MAP not enabled!"
   echo ""
@@ -309,7 +303,7 @@ if [[ $TODO == "defconfig" ]]; then
   exit 0
 fi
 
-echo "::group::[*] Swap & Memory Optimization for LTO"
+echo "::group::[*] Swap & Memory Optimization"
 
 info "Initial storage: $(df -h / | awk 'NR==2 {print $4}') available"
 info "Initial memory:  $(free -h | awk '/^Mem:/ {print $7}') available"
@@ -323,7 +317,7 @@ if [ -f /mnt/swapfile ]; then
   sudo rm -f /mnt/swapfile
 fi
 
-warning "Creating 15GB swap for Heavy Link-Time Optimization (Full LTO)"
+warning "Creating 15GB swap"
 sudo fallocate -l 15G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=15360 status=none
 sudo chmod 600 /swapfile
 sudo mkswap /swapfile
@@ -358,7 +352,7 @@ sed -i \
   "$WORKDIR/anykernel/anykernel.sh"
 
 cd anykernel
-log "Zipping anykernel and creating Enforcer Init.rc"
+log "Zipping anykernel and creating init.special.rc"
 if [ ! -f "$KERNEL_IMAGE" ]; then
   error "$KERNEL_IMAGE not found."
   exit 1
@@ -376,7 +370,6 @@ on property:sys.boot_completed=1
     write /sys/block/mmcblk0/queue/scheduler none
 EOF
 
-# Update AnyKernel script to automatically parse our custom init modifications for swapping and io
 sed -i '/write_boot;/i \
 insert_line init.rc "init.special.rc" after "import /init.environ.rc" "import /init.special.rc";' anykernel.sh
 
