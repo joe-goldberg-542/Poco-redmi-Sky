@@ -129,7 +129,7 @@ build_and_install_pahole() {
 
     if [[ ! -d "$pahole_dir/.git" ]]; then
         rm -rf "$pahole_dir"
-        git clone --depth=1 https://git.kernel.org/pub/scm/devel/pahole/pahole.git "$pahole_dir" || {
+        git clone --depth=1 --recurse-submodules --shallow-submodules https://github.com/acmel/dwarves.git "$pahole_dir" || {
             error "failed to clone pahole"
             return 1
         }
