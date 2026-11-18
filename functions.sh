@@ -210,6 +210,17 @@ BASE = "main"
 CUTOFF = int(time.time()) - (90 * 86400)
 TOKEN = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
 
+IGNORED_WORKFLOWS = {"Lints Check"}
+IGNORED_CHECKS = {
+    "ClangFormat check",
+    "Rustfmt check",
+    "Clippy check",
+    "ShellCheck",
+    "Check Line Endings",
+    "Check Manager Lint",
+}
+IGNORED_BRANCH_PREFIXES = ("renovate/", "weblate-")
+
 def gh_api(path):
     url = f"https://api.github.com/repos/{OWNER}/{REPO}{path}"
     headers = {
@@ -234,23 +245,59 @@ try:
 except Exception as e:
     print(f"[WARN] PR fetch error: {e}")
 
+def get_check_runs(sha):
+    all_runs = []
+    page = 1
+    while True:
+        data = gh_api(f"/commits/{sha}/check-runs?filter=latest&per_page=100&page={page}")
+        batch = data.get("check_runs", [])
+        all_runs.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return all_runs
+
 def is_green(sha):
     try:
-        runs = gh_api(f"/commits/{sha}/check-runs?per_page=100").get("check_runs", [])
+        ignored_suite_ids = set()
+        try:
+            wf_runs = gh_api(f"/actions/runs?head_sha={sha}&per_page=100").get("workflow_runs", [])
+            for wf in wf_runs:
+                if wf.get("name") in IGNORED_WORKFLOWS and wf.get("check_suite_id"):
+                    ignored_suite_ids.add(wf["check_suite_id"])
+        except Exception as e:
+            print(f"[WARN] workflow_runs fetch error for {sha[:7]}: {e}")
+
+        runs = get_check_runs(sha)
         if not runs:
-            return False
+            return False, ["no check-runs found"]
+
         ok = False
+        failed = []
         for r in runs:
-            if r.get("status") != "completed":
-                return False
+            name = r.get("name") or ""
+            suite_id = (r.get("check_suite") or {}).get("id")
+
+            # Lints Check workflow aur lint checks ko ignore karo
+            if name in IGNORED_CHECKS or suite_id in ignored_suite_ids:
+                continue
+
+            status = r.get("status")
             c = r.get("conclusion")
-            if c == "success":
+            if status != "completed":
+                failed.append(f"{name} ({status})")
+            elif c == "success":
                 ok = True
             elif c not in ("skipped", "neutral"):
-                return False
-        return ok
-    except Exception:
-        return False
+                failed.append(f"{name} ({c})")
+
+        if failed:
+            return False, failed
+        if not ok:
+            return False, ["no non-lint checks succeeded"]
+        return True, []
+    except Exception as e:
+        return False, [f"api error: {e}"]
 
 fmt = "%(refname:short)|%(objectname)|%(committerdate:unix)"
 refs = run_git(
@@ -267,9 +314,21 @@ for line in refs:
     if branch in (BASE, "HEAD") or int(ts) < CUTOFF:
         continue
 
+    if branch.startswith(IGNORED_BRANCH_PREFIXES):
+        print(f"[SKIP] {branch}: ignored bot/translation branch")
+        continue
+
     ahead_str = run_git("rev-list", "--count", f"origin/{BASE}..{ref}").stdout.strip()
     ahead = int(ahead_str) if ahead_str.isdigit() else 0
-    if ahead <= 0 or branch in drafts or not is_green(sha):
+    if ahead <= 0:
+        continue
+    if branch in drafts:
+        print(f"[SKIP] {branch}: draft PR")
+        continue
+
+    green, reasons = is_green(sha)
+    if not green:
+        print(f"[SKIP] {branch}: checks failed -> {', '.join(reasons[:5])}")
         continue
 
     res = run_git("merge", "--no-edit", "-m", f"Merge {branch} into {BASE}", ref)
