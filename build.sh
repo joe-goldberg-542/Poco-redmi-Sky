@@ -12,6 +12,13 @@ KERNEL_DEFCONFIG="gki_defconfig"
 KERNEL_VERSION="6.6"
 ANDROID_RELEASE="15"
 
+FINASU_BRANCH="${FINASU_BRANCH:-dev}"
+NOMOUNT_BRANCH="${NOMOUNT_BRANCH:-dev}"
+KSU_HOOK="${KSU_HOOK:-tracepoint}"
+
+KSU_EXPECTED_SIZE2="${KSU_EXPECTED_SIZE2:-0x02cc}"
+KSU_EXPECTED_HASH2="${KSU_EXPECTED_HASH2:-2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458}"
+
 sudo timedatectl set-timezone "$TIMEZONE" || export TZ="$TIMEZONE"
 
 RELEASE="$(date +v%y.%m.%d)${RUN_NUM}"
@@ -58,19 +65,24 @@ cd "$WORKDIR"
 
 log "Setting Kernel variant"
 case "$KSU" in
-  "KSU") VARIANT="BakaSU" ;;
+  "KSU") VARIANT="FinaSU" ;;
   "no") VARIANT="Vanilla" ;;
   "vnlto") VARIANT="Vanilla+NoLTO" ;;
   *) VARIANT="Vanilla" ;;
 esac
 
-susfs_included && VARIANT+="+SuSFS"
+if [ "$KSU" = "KSU" ] && susfs_included; then
+  VARIANT+="+SuSFS"
+  if [ "$KSU_HOOK" = "susfs_inline" ]; then
+    VARIANT+="+Inline"
+  fi
+fi
+
 SUSFS_URL="https://gitlab.com/simonpunk/susfs4ksu"
 SUSFS_DIR="$WORKDIR/susfs"
 SUSFS_PATCHES="${SUSFS_DIR}/kernel_patches"
 
-SUSFS_BRANCH="$(resolve_susfs_branch)"
-SUSFS_PATCH="$SUSFS_BRANCH"
+SUSFS_BRANCH="${SUSFS_BRANCH:-$(resolve_susfs_branch)}"
 
 log "Changelog of repos"
 clone_susfs 5
@@ -79,9 +91,9 @@ git log --pretty=format:"- [%h](https://${SUSFS_URL#https://}/commit/%H) %s" -5 
   > "$RELEASE_DIR/susfs_changelog-${KERNEL_VERSION}.txt"
 cd "$WORKDIR"
 
-generate_gh_changelog "xiaomi-ravelin/android_kernel_xiaomi_sm4450" "$KERNEL_BRANCH" 10 "$RELEASE_DIR/android_kernel-6.6_changelog.txt"
-generate_gh_changelog "maxsteeel/nomount" "dev" 5 "$RELEASE_DIR/nomount_changelog.txt"
-generate_gh_changelog "Baka-SU/BakaSU" "main" 5 "$RELEASE_DIR/ksu_changelog.txt"
+generate_gh_changelog "$(simplify_gh_url "$KERNEL_REPO")" "$KERNEL_BRANCH" 10 "$RELEASE_DIR/android_kernel-6.6_changelog.txt"
+generate_gh_changelog "maxsteeel/nomount" "$NOMOUNT_BRANCH" 5 "$RELEASE_DIR/nomount_changelog.txt"
+generate_gh_changelog "LyraVoid/FinaSU" "$FINASU_BRANCH" 5 "$RELEASE_DIR/ksu_changelog.txt"
 
 echo "::group::[*] Downloading Clang"
 CLANG_BIN="$WORKDIR/neutron-clang/bin"
@@ -110,21 +122,19 @@ echo "::group::[+] pahole installation"
 build_and_install_pahole
 echo "::endgroup::"
 
-echo "::group::[+] Applied patches"
+echo "::group::[+] Manual integrations (FinaSU / SUSFS / NoMount / Kyber)"
 
 export DROIDSPACES="false"
 export NH="false"
 
+apply_kyber_default_patch
+
 if [ "$KSU" = "KSU" ]; then
-  integrate_bakasu
+  integrate_finasu_manual
 
   if susfs_included; then
     clone_susfs
-    apply_susfs_patches
-    apply_selinux_symbol_exports
-  else
-    apply_bakasu_manual_hooks
-    apply_selinux_symbol_exports
+    apply_susfs_manual
   fi
 fi
 
@@ -144,32 +154,35 @@ log "Applying inline defconfigs..."
 
 cat << 'EOF' >> arch/arm64/configs/gki_defconfig
 CONFIG_RCU_TRACE=n
+CONFIG_TCP_CONG_ADVANCED=y
+CONFIG_TCP_CONG_BBR=y
+CONFIG_DEFAULT_BBR=y
+CONFIG_DEFAULT_CUBIC=n
+CONFIG_DEFAULT_RENO=n
+CONFIG_DEFAULT_TCP_CONG="bbr"
+CONFIG_NET_SCHED=y
+CONFIG_NET_SCH_FQ=y
+CONFIG_NET_SCH_FQ_CODEL=y
+CONFIG_MQ_IOSCHED_KYBER=y
 EOF
 
 if [ "$KSU" != "no" ] && [ "$KSU" != "vnlto" ]; then
   cat << 'EOF' >> arch/arm64/configs/gki_defconfig
 CONFIG_KSU=y
-CONFIG_HEADERS_INSTALL=y
-CONFIG_EXT4_FS=y
+CONFIG_KPROBES=y
 CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+CONFIG_EXT4_FS=y
+CONFIG_HEADERS_INSTALL=y
 CONFIG_OVERLAY_FS=y
 EOF
-
-  if ! susfs_included; then
-    cat << 'EOF' >> arch/arm64/configs/gki_defconfig
-CONFIG_KSU_MANUAL_HOOK=y
-CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK=y
-CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK=y
-CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK=y
-EOF
-  fi
 fi
 
 if [ "$NM" = "true" ]; then
   echo "CONFIG_NOMOUNT=y" >> arch/arm64/configs/gki_defconfig
 fi
 
-if susfs_included; then
+if [ "$KSU" = "KSU" ] && susfs_included; then
   cat << 'EOF' >> arch/arm64/configs/gki_defconfig
 CONFIG_KSU_SUSFS=y
 CONFIG_THREAD_INFO_IN_TASK=y
@@ -186,6 +199,18 @@ CONFIG_KSU_SUSFS_SUS_MEMFD=y
 CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y
 CONFIG_KSU_SUSFS_SUS_PROC_FD_LINK=y
 EOF
+
+  if [ "$KSU_HOOK" = "susfs_inline" ]; then
+    cat << 'EOF' >> arch/arm64/configs/gki_defconfig
+CONFIG_KSU_HOOK_TRACEPOINT=n
+CONFIG_KSU_HOOK_SUSFS_INLINE=y
+EOF
+  else
+    cat << 'EOF' >> arch/arm64/configs/gki_defconfig
+CONFIG_KSU_HOOK_TRACEPOINT=y
+CONFIG_KSU_HOOK_SUSFS_INLINE=n
+EOF
+  fi
 fi
 
 export KCFLAGS="-w"
@@ -207,6 +232,16 @@ MAKE_ARGS=(
   -j"$(nproc --all)"
   O="$OUTDIR"
 )
+
+KSU_MAKE_ARGS=()
+if [ "$KSU" != "no" ] && [ "$KSU" != "vnlto" ]; then
+  KSU_MAKE_ARGS+=(
+    KSU_REQUIRE_PREINIT=1
+    KSU_EXPECTED_SIZE2="$KSU_EXPECTED_SIZE2"
+    KSU_EXPECTED_HASH2="$KSU_EXPECTED_HASH2"
+    KSU_SECOND_SIGNATURE_RELEASE=1
+  )
+fi
 
 if [ "${LTO:-full}" = "thin" ]; then
   log "ThinLTO enabled"
@@ -231,6 +266,57 @@ if [ -f "arch/arm64/configs/vendor/parrot_perf.config" ]; then
   make "${MAKE_ARGS[@]}" "$KERNEL_DEFCONFIG" vendor/parrot_perf.config
 else
   make "${MAKE_ARGS[@]}" "$KERNEL_DEFCONFIG"
+fi
+
+./scripts/config --file "$OUTDIR/.config" \
+  -e TCP_CONG_ADVANCED \
+  -e TCP_CONG_BBR \
+  -e DEFAULT_BBR \
+  -d DEFAULT_CUBIC \
+  -d DEFAULT_RENO \
+  --set-str DEFAULT_TCP_CONG "bbr" \
+  -e NET_SCHED \
+  -e NET_SCH_FQ \
+  -e NET_SCH_FQ_CODEL \
+  -e MQ_IOSCHED_KYBER
+
+if [ "$KSU" != "no" ] && [ "$KSU" != "vnlto" ]; then
+  ./scripts/config --file "$OUTDIR/.config" \
+    -e KSU \
+    -e KPROBES \
+    -e KALLSYMS \
+    -e KALLSYMS_ALL \
+    -e EXT4_FS \
+    -e HEADERS_INSTALL \
+    -e OVERLAY_FS \
+    -d KSU_MANUAL_HOOK
+
+  if susfs_included; then
+    ./scripts/config --file "$OUTDIR/.config" \
+      -e KSU_SUSFS \
+      -e THREAD_INFO_IN_TASK
+
+    if [ "$KSU_HOOK" = "susfs_inline" ]; then
+      log "Selecting FinaSU syscall backend: SUSFS Inline (ARM64 Built-In)"
+      ./scripts/config --file "$OUTDIR/.config" \
+        -d KSU_HOOK_TRACEPOINT \
+        -e KSU_HOOK_SUSFS_INLINE
+    else
+      log "Selecting FinaSU syscall backend: Tracepoint"
+      ./scripts/config --file "$OUTDIR/.config" \
+        -e KSU_HOOK_TRACEPOINT \
+        -d KSU_HOOK_SUSFS_INLINE
+    fi
+  else
+    log "Selecting FinaSU syscall backend: Tracepoint"
+    ./scripts/config --file "$OUTDIR/.config" \
+      -e KSU_HOOK_TRACEPOINT \
+      -d KSU_HOOK_SUSFS_INLINE
+  fi
+fi
+
+if [ "$NM" = "true" ]; then
+  ./scripts/config --file "$OUTDIR/.config" -e NOMOUNT
 fi
 
 log "Configuring governor, zRAM, and localversion"
@@ -273,27 +359,60 @@ case "${LTO:-full}" in
     ;;
 esac
 
-sed -i 's/CONFIG_CMDLINE="/CONFIG_CMDLINE="elevator=none /' "$OUTDIR/.config"
-
 make "${MAKE_ARGS[@]}" olddefconfig > /dev/null
 
-log "Checking .config for LTO"
+log "Checking .config for LTO, BBR, and Kyber"
 grep "CONFIG_LTO" "$OUTDIR/.config" || true
+grep -E '^CONFIG_(TCP_CONG_BBR|DEFAULT_BBR|DEFAULT_TCP_CONG|NET_SCH_FQ|MQ_IOSCHED_KYBER)=' "$OUTDIR/.config" || true
 echo "::endgroup::"
 
-if susfs_included; then
-  log "Checking defconfig for SUSFS"
-  grep -i susfs ./arch/arm64/configs/gki_defconfig || error "SUSFS NOT FOUND in defconfig!"
-  echo ""
+for opt in CONFIG_TCP_CONG_BBR CONFIG_NET_SCH_FQ CONFIG_MQ_IOSCHED_KYBER; do
+  if ! grep -q "^${opt}=y$" "$OUTDIR/.config"; then
+    error "Required tuning option missing in .config: ${opt}=y"
+    exit 1
+  fi
+done
 
+if ! grep -q '^CONFIG_DEFAULT_TCP_CONG="bbr"$' "$OUTDIR/.config"; then
+  error 'CONFIG_DEFAULT_TCP_CONG="bbr" not set in .config!'
+  exit 1
+fi
+
+if [ "$KSU" != "no" ] && [ "$KSU" != "vnlto" ]; then
+  log "Checking .config for FinaSU required options"
+  for opt in CONFIG_KSU CONFIG_KPROBES CONFIG_KALLSYMS_ALL CONFIG_EXT4_FS CONFIG_HEADERS_INSTALL; do
+    if ! grep -q "^${opt}=y$" "$OUTDIR/.config"; then
+      error "Required FinaSU option missing in .config: ${opt}=y"
+      exit 1
+    fi
+  done
+  grep -E '^CONFIG_KSU(_HOOK_.*)?=' "$OUTDIR/.config" || true
+
+  if grep -q '^CONFIG_KSU_HOOK_TRACEPOINT=y$' "$OUTDIR/.config" && grep -q '^CONFIG_KSU_HOOK_SUSFS_INLINE=y$' "$OUTDIR/.config"; then
+    error "Both CONFIG_KSU_HOOK_TRACEPOINT and CONFIG_KSU_HOOK_SUSFS_INLINE are enabled!"
+    exit 1
+  fi
+fi
+
+if [ "$KSU" = "KSU" ] && susfs_included; then
   log "Checking .config for SUSFS"
   grep CONFIG_KSU_SUSFS "$OUTDIR/.config" || error "SUSFS NOT ENABLED in .config!"
+  grep CONFIG_THREAD_INFO_IN_TASK "$OUTDIR/.config" || error "CONFIG_THREAD_INFO_IN_TASK not enabled!"
   grep CONFIG_KSU_SUSFS_SUS_MAP "$OUTDIR/.config" || error "SUSFS_SUS_MAP not enabled!"
   echo ""
 
-  if grep -q "CONFIG_KSU_SUSFS" ./arch/arm64/configs/gki_defconfig && ! grep -q "CONFIG_KSU_SUSFS=y" "$OUTDIR/.config"; then
+  if ! grep -q "^CONFIG_KSU_SUSFS=y$" "$OUTDIR/.config"; then
     warning "SUSFS in defconfig but not in .config - checking dependencies..."
     grep "depends on" $(find . -name "Kconfig" -exec grep -l "KSU_SUSFS" {} \;) 2>/dev/null || error "No dependency info found"
+    exit 1
+  fi
+fi
+
+if [ "$NM" = "true" ]; then
+  log "Checking .config for NoMount"
+  if ! grep -q "^CONFIG_NOMOUNT=y$" "$OUTDIR/.config"; then
+    error "CONFIG_NOMOUNT=y not enabled in .config!"
+    exit 1
   fi
 fi
 
@@ -345,7 +464,7 @@ echo "::endgroup::"
 
 set -eo pipefail
 echo "::group::[*] Building kernel"
-make "${MAKE_ARGS[@]}" CC="clang" CXX="clang++"
+make "${MAKE_ARGS[@]}" "${KSU_MAKE_ARGS[@]}" CC="clang" CXX="clang++"
 echo "::endgroup::"
 
 cd "$WORKDIR"
@@ -372,10 +491,30 @@ cat << 'EOF' > overlay.d/init.special.rc
 on property:sys.boot_completed=1
     write /proc/sys/vm/swappiness 60
     write /proc/sys/vm/vfs_cache_pressure 100
-    write /sys/block/sda/queue/scheduler none
-    write /sys/block/sdb/queue/scheduler none
-    write /sys/block/sdc/queue/scheduler none
-    write /sys/block/mmcblk0/queue/scheduler none
+    write /proc/sys/net/core/default_qdisc fq
+    write /proc/sys/net/ipv4/tcp_congestion_control bbr
+    write /sys/block/sda/queue/scheduler kyber
+    write /sys/block/sdb/queue/scheduler kyber
+    write /sys/block/sdc/queue/scheduler kyber
+    write /sys/block/sdd/queue/scheduler kyber
+    write /sys/block/sde/queue/scheduler kyber
+    write /sys/block/sdf/queue/scheduler kyber
+    write /sys/block/mmcblk0/queue/scheduler kyber
+    write /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq 499200
+    write /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 499200
+
+on property:vendor.post_boot.parsed=1
+    write /proc/sys/net/core/default_qdisc fq
+    write /proc/sys/net/ipv4/tcp_congestion_control bbr
+    write /sys/block/sda/queue/scheduler kyber
+    write /sys/block/sdb/queue/scheduler kyber
+    write /sys/block/sdc/queue/scheduler kyber
+    write /sys/block/sdd/queue/scheduler kyber
+    write /sys/block/sde/queue/scheduler kyber
+    write /sys/block/sdf/queue/scheduler kyber
+    write /sys/block/mmcblk0/queue/scheduler kyber
+    write /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq 499200
+    write /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 499200
 EOF
 
 sed -i '/write_boot;/i \
