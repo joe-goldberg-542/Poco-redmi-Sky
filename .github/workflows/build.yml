@@ -38,9 +38,17 @@ on:
         default: false
 
       BUILD_KSU:
-        description: "Build with BakaSU + SUSFS"
+        description: "Build with FinaSU + SUSFS"
         type: boolean
         default: true
+
+      KSU_HOOK:
+        description: "FinaSU syscall hook backend"
+        default: "tracepoint"
+        type: choice
+        options:
+          - "tracepoint"
+          - "susfs_inline"
 
       DROIDSPACES:
         description: "Enable droidspaces-oss support"
@@ -107,9 +115,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           KERNEL_VERSION: "6.6"
+          FINASU_BRANCH: "dev"
+          SUSFS_BRANCH: "gki-android15-6.6-dev"
+          NOMOUNT_BRANCH: "dev"
           KSU: ${{ matrix.KSU }}
           KSU_COMPAT: ${{ matrix.KSU_COMPAT }}
           KSU_SUSFS: ${{ matrix.KSU_SUSFS }}
+          KSU_HOOK: ${{ inputs.KSU_HOOK }}
           C_LTO: ${{ matrix.C_LTO }}
           No_DS: ${{ matrix.No_DS }}
           TODO: ${{ inputs.TODO }}
