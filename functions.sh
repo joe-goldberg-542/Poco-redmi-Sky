@@ -3,8 +3,9 @@
 resolve_kernel_source() {
   echo "https://github.com/suvojeet-sengupta/android_kernel_xiaomi_sm4450|lineage-24.0|android15-6.6"
 }
+
 resolve_susfs_branch() {
-  echo "gki-android15-6.6"
+  echo "gki-android15-6.6-dev"
 }
 
 susfs_included() {
@@ -91,7 +92,41 @@ generate_gh_changelog() {
 
     gh api "repos/${repo}/commits?sha=${branch}&per_page=${count}" \
         --jq '.[] | "- [" + .sha[0:7] + "](" + .html_url + ") " + (.commit.message | split("\n")[0])' \
-        > "$output"
+        > "$output" || warning "Failed to generate changelog for ${repo}@${branch}"
+}
+
+insert_kconfig_source() {
+    local kconfig_file="$1"
+    local source_line="$2"
+
+    python3 - "$kconfig_file" "$source_line" << 'EOF'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+line = sys.argv[2].strip()
+
+if not path.exists():
+    raise SystemExit(f"[-] Missing Kconfig file: {path}")
+
+lines = path.read_text().splitlines(keepends=True)
+lines = [l for l in lines if l.strip() != line]
+
+last_endmenu = -1
+for i, l in enumerate(lines):
+    if l.strip() == "endmenu":
+        last_endmenu = i
+
+entry = line + "\n"
+if last_endmenu != -1:
+    lines.insert(last_endmenu, entry)
+else:
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    lines.append(entry)
+
+path.write_text("".join(lines))
+EOF
 }
 
 build_and_install_pahole() {
@@ -179,380 +214,162 @@ build_and_install_pahole() {
     return 0
 }
 
-integrate_bakasu() {
-    local start_dir
-    start_dir="$(pwd)"
+apply_kyber_default_patch() {
+    local kroot="."
+    [ -d "common/block" ] && kroot="common"
+    local elevator_file="$kroot/block/elevator.c"
 
-    log "Integrating BakaSU..."
-    rm -rf KernelSU FinaSU BakaSU drivers/kernelsu
-    sed -i '/kernelsu/d' drivers/Makefile 2>/dev/null || true
-    sed -i '/kernelsu/d' drivers/Kconfig 2>/dev/null || true
+    if [ ! -f "$elevator_file" ]; then
+        error "Missing $elevator_file"
+        return 1
+    fi
 
-    curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | command bash -s main
+    log "Patching $elevator_file to set kyber as default I/O scheduler..."
+    python3 - "$elevator_file" << 'EOF'
+import sys
+from pathlib import Path
 
-    cd KernelSU
-    command git config user.name "joe-goldberg-542"
-    command git config user.email "joe_goldberg_542@protonmail.com"
-    command git config --local remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
-    command git fetch --quiet origin --prune
-    command git checkout -B main origin/main
+path = Path(sys.argv[1])
+src = path.read_text()
 
-    python3 - << 'EOF'
-import json
-import os
-import subprocess
-import time
-import urllib.request
+if 'elevator_find_get(q, "kyber")' in src:
+    sys.exit(0)
 
-OWNER = "Baka-SU"
-REPO = "BakaSU"
-BASE = "main"
-CUTOFF = int(time.time()) - (90 * 86400)
-TOKEN = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+target = 'return elevator_find_get(q, "mq-deadline");'
+replacement = (
+    '{\n'
+    '\t\tstruct elevator_type *e = elevator_find_get(q, "kyber");\n'
+    '\t\tif (e)\n'
+    '\t\t\treturn e;\n'
+    '\t\treturn elevator_find_get(q, "mq-deadline");\n'
+    '\t}'
+)
 
-IGNORED_WORKFLOWS = {"Lints Check"}
-IGNORED_CHECKS = {
-    "ClangFormat check",
-    "Rustfmt check",
-    "Clippy check",
-    "ShellCheck",
-    "Check Line Endings",
-    "Check Manager Lint",
-}
-IGNORED_BRANCH_PREFIXES = ("renovate/", "weblate-")
+if target not in src:
+    raise SystemExit("[-] Could not find mq-deadline default in block/elevator.c")
 
-def gh_api(path):
-    url = f"https://api.github.com/repos/{OWNER}/{REPO}{path}"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "BakaSU-Merger"
-    }
-    if TOKEN:
-        headers["Authorization"] = f"Bearer {TOKEN}"
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode())
-
-def run_git(*args):
-    return subprocess.run(["git", *args], capture_output=True, text=True)
-
-drafts = set()
-try:
-    for pr in gh_api("/pulls?state=open&per_page=100"):
-        ref = pr.get("head", {}).get("ref")
-        if ref and pr.get("draft", False):
-            drafts.add(ref)
-except Exception as e:
-    print(f"[WARN] PR fetch error: {e}")
-
-def get_check_runs(sha):
-    all_runs = []
-    page = 1
-    while True:
-        data = gh_api(f"/commits/{sha}/check-runs?filter=latest&per_page=100&page={page}")
-        batch = data.get("check_runs", [])
-        all_runs.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
-    return all_runs
-
-def is_green(sha):
-    try:
-        ignored_suite_ids = set()
-        try:
-            wf_runs = gh_api(f"/actions/runs?head_sha={sha}&per_page=100").get("workflow_runs", [])
-            for wf in wf_runs:
-                if wf.get("name") in IGNORED_WORKFLOWS and wf.get("check_suite_id"):
-                    ignored_suite_ids.add(wf["check_suite_id"])
-        except Exception as e:
-            print(f"[WARN] workflow_runs fetch error for {sha[:7]}: {e}")
-
-        runs = get_check_runs(sha)
-        if not runs:
-            return False, ["no check-runs found"]
-
-        ok = False
-        failed = []
-        for r in runs:
-            name = r.get("name") or ""
-            suite_id = (r.get("check_suite") or {}).get("id")
-
-            # Lints Check workflow aur lint checks ko ignore karo
-            if name in IGNORED_CHECKS or suite_id in ignored_suite_ids:
-                continue
-
-            status = r.get("status")
-            c = r.get("conclusion")
-            if status != "completed":
-                failed.append(f"{name} ({status})")
-            elif c == "success":
-                ok = True
-            elif c not in ("skipped", "neutral"):
-                failed.append(f"{name} ({c})")
-
-        if failed:
-            return False, failed
-        if not ok:
-            return False, ["no non-lint checks succeeded"]
-        return True, []
-    except Exception as e:
-        return False, [f"api error: {e}"]
-
-fmt = "%(refname:short)|%(objectname)|%(committerdate:unix)"
-refs = run_git(
-    "for-each-ref", "--sort=-committerdate", f"--format={fmt}", "refs/remotes/origin/"
-).stdout.strip().splitlines()
-
-merged = []
-for line in refs:
-    if "|" not in line:
-        continue
-    ref, sha, ts = line.split("|", 2)
-    branch = ref.replace("origin/", "", 1)
-
-    if branch in (BASE, "HEAD") or int(ts) < CUTOFF:
-        continue
-
-    if branch.startswith(IGNORED_BRANCH_PREFIXES):
-        print(f"[SKIP] {branch}: ignored bot/translation branch")
-        continue
-
-    ahead_str = run_git("rev-list", "--count", f"origin/{BASE}..{ref}").stdout.strip()
-    ahead = int(ahead_str) if ahead_str.isdigit() else 0
-    if ahead <= 0:
-        continue
-    if branch in drafts:
-        print(f"[SKIP] {branch}: draft PR")
-        continue
-
-    green, reasons = is_green(sha)
-    if not green:
-        print(f"[SKIP] {branch}: checks failed -> {', '.join(reasons[:5])}")
-        continue
-
-    res = run_git("merge", "--no-edit", "-m", f"Merge {branch} into {BASE}", ref)
-    if res.returncode == 0:
-        merged.append(branch)
-        print(f"[OK] Merged into {BASE}: {branch} (+{ahead})")
-    else:
-        run_git("merge", "--abort")
-        err_msg = (res.stderr or res.stdout).strip().splitlines()
-        reason = err_msg[-1] if err_msg else "conflict"
-        print(f"[SKIP] {branch}: {reason}")
-
-print(f"Total dynamic branches merged into {BASE}: {len(merged)}")
+path.write_text(src.replace(target, replacement, 1))
 EOF
+    success "Default kernel I/O scheduler patched to kyber"
+}
 
-    cd "$start_dir"
+integrate_finasu_manual() {
+    local finasu_repo="https://github.com/LyraVoid/FinaSU.git"
+    local finasu_branch="${FINASU_BRANCH:-dev}"
+    local driver_dir="drivers"
+    local symlink_target="../FinaSU/kernel"
+
+    if [ -d "common/drivers" ]; then
+        driver_dir="common/drivers"
+        symlink_target="../../FinaSU/kernel"
+    fi
+
+    log "Cleaning previous KernelSU/BakaSU/FinaSU integrations..."
+    rm -rf KernelSU FinaSU BakaSU "$driver_dir/kernelsu"
+    sed -i '/kernelsu/d' "$driver_dir/Makefile" 2>/dev/null || true
+    sed -i '/kernelsu/d' "$driver_dir/Kconfig" 2>/dev/null || true
+
+    log "Cloning FinaSU ($finasu_branch) with full git metadata..."
+    git clone -q -b "$finasu_branch" "$finasu_repo" ./FinaSU
+
+    if [ ! -d "./FinaSU/kernel" ]; then
+        error "FinaSU/kernel directory not found after clone!"
+        return 1
+    fi
+
+    log "Manually wiring FinaSU into $driver_dir..."
+    ln -sfn "$symlink_target" "$driver_dir/kernelsu"
+
+    if ! grep -q 'kernelsu/' "$driver_dir/Makefile"; then
+        printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> "$driver_dir/Makefile"
+    fi
+
+    insert_kconfig_source "$driver_dir/Kconfig" 'source "drivers/kernelsu/Kconfig"'
+
+    local finasu_ver
+    finasu_ver=$(command git -C ./FinaSU describe --tags --always 2>/dev/null || command git -C ./FinaSU rev-parse --short HEAD)
+    success "FinaSU manually integrated (${finasu_ver})"
 }
 
 clone_susfs() {
-    DEPTH=${1:-1}
+    local DEPTH=${1:-1}
     if [ ! -d "$SUSFS_DIR" ]; then
         log "Cloning $SUSFS_URL (branch $SUSFS_BRANCH, depth $DEPTH)"
-        git clone --depth=$DEPTH -q "$SUSFS_URL" -b "$SUSFS_BRANCH" "$SUSFS_DIR"
+        git clone --depth="$DEPTH" -q "$SUSFS_URL" -b "$SUSFS_BRANCH" "$SUSFS_DIR"
     else
         log "$SUSFS_DIR already exists, reusing existing clone"
     fi
 }
 
-apply_susfs_patches() {
-    log "Applying SUSFS kernel patches"
+apply_susfs_manual() {
+    local kroot="."
+    [ -d "common/fs" ] && kroot="common"
 
-    cp "$SUSFS_PATCHES/50_add_susfs_in_${SUSFS_PATCH}.patch" ./
-    cp -R "$SUSFS_PATCHES/fs/"* ./fs/
-    cp -R "$SUSFS_PATCHES/include/linux/"* ./include/linux/
+    local patch_file
+    patch_file=$(find "$SUSFS_PATCHES" -maxdepth 1 -type f -name "50_add_susfs_in_*.patch" | head -n 1)
+    if [ -z "$patch_file" ] || [ ! -f "$patch_file" ]; then
+        error "SUSFS patch not found in $SUSFS_PATCHES"
+        return 1
+    fi
 
-    patch -p1 --fuzz=3 < "50_add_susfs_in_${SUSFS_PATCH}.patch"
-    echo "CFLAGS_susfs.o += -Wno-unused-function" >> ./fs/Makefile
+    local patch_name
+    patch_name=$(basename "$patch_file")
 
-    rm -f ./android/abi_gki_protected_exports_aarch64 \
-          ./android/abi_gki_protected_exports_x86_64
+    log "Manually copying SUSFS kernel files into $kroot/fs and $kroot/include/linux..."
+    cp -rf "$SUSFS_PATCHES/fs/"* "$kroot/fs/"
+    cp -rf "$SUSFS_PATCHES/include/linux/"* "$kroot/include/linux/"
 
-    SUSFS_VERSION=$(grep -E '^#define SUSFS_VERSION' ./include/linux/susfs.h | cut -d' ' -f3 | sed 's/"//g')
+    log "Manually applying SUSFS kernel patch ($patch_name)..."
+    cp -f "$patch_file" "$kroot/$patch_name"
+    (
+        cd "$kroot" || exit 1
+        patch -p1 --forward --fuzz=3 < "$patch_name"
+    )
+
+    if ! grep -q 'CFLAGS_susfs.o' "$kroot/fs/Makefile"; then
+        printf '\nCFLAGS_susfs.o += -Wno-unused-function\n' >> "$kroot/fs/Makefile"
+    fi
+
+    rm -f "$kroot/android/abi_gki_protected_exports_aarch64" \
+          "$kroot/android/abi_gki_protected_exports_x86_64"
+
+    if [ ! -f "$kroot/include/linux/susfs.h" ]; then
+        error "include/linux/susfs.h missing after SUSFS copy!"
+        return 1
+    fi
+
+    SUSFS_VERSION=$(grep -E '^#define SUSFS_VERSION' "$kroot/include/linux/susfs.h" | awk '{print $3}' | tr -d '"')
     echo "SUSFS_VERSION=$SUSFS_VERSION" >> "$GITHUB_ENV"
-}
-
-apply_selinux_symbol_exports() {
-    log "Applying SELinux static symbol exports"
-
-    python3 - << 'EOF'
-import re
-from pathlib import Path
-
-def patch_file(path_str, fn):
-    p = Path(path_str)
-    if not p.exists():
-        raise SystemExit(f"Missing file: {path_str}")
-    orig = p.read_text()
-    updated = fn(orig)
-    if orig != updated:
-        p.write_text(updated)
-        print(f"[OK] Patched {path_str}")
-
-def patch_selinuxfs(s):
-    s = re.sub(
-        r'static\s+(ssize_t\s+\(\*write_op\[\]\)\(struct file \*, char \*, size_t\)\s*=\s*\{)',
-        r'\1', s
-    )
-    return re.sub(
-        r'static\s+(const\s+struct\s+file_operations\s+sel_handle_status_ops\s*=\s*\{)',
-        r'\1', s
-    )
-
-def patch_selinux_services(s):
-    s = re.sub(r'static\s+(void\s+security_dump_masked_av\s*\()', r'\1', s)
-    return re.sub(r'static\s+(void\s+context_struct_compute_av\s*\()', r'\1', s)
-
-patch_file("security/selinux/selinuxfs.c", patch_selinuxfs)
-patch_file("security/selinux/ss/services.c", patch_selinux_services)
-EOF
-}
-
-apply_bakasu_manual_hooks() {
-    log "Applying BakaSU manual hooks"
-
-    python3 - << 'EOF'
-import re
-from pathlib import Path
-
-def patch_file(path_str, fn):
-    p = Path(path_str)
-    if not p.exists():
-        raise SystemExit(f"Missing file: {path_str}")
-    orig = p.read_text()
-    updated = fn(orig)
-    if orig != updated:
-        p.write_text(updated)
-        print(f"[OK] Patched {path_str}")
-
-def patch_stat(s):
-    if "ksu_handle_newfstat_ret" in s:
-        return s
-    ext = (
-        "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-        "__attribute__((hot))\n"
-        "extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n"
-        "\t\t\t\tint *flags);\n\n"
-        "extern void ksu_handle_newfstat_ret(unsigned int *fd, "
-        "struct stat __user **statbuf_ptr);\n"
-        "#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)\n"
-        "extern void ksu_handle_fstat64_ret(unsigned long *fd, "
-        "struct stat64 __user **statbuf_ptr);\n"
-        "#endif\n"
-        "#endif\n\n"
-    )
-    s = re.sub(r'(SYSCALL_DEFINE4\(newfstatat,)', ext + r'\1', s, count=1)
-    s = re.sub(
-        r'(\terror = vfs_fstatat\(dfd, filename, &stat, flag\);)',
-        '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
-        '\tksu_handle_stat(&dfd, &filename, &flag);\n'
-        '#endif\n\\1',
-        s
-    )
-    s = re.sub(
-        r'(SYSCALL_DEFINE2\(newfstat,[\s\S]*?cp_new_stat\(&stat, statbuf\);\n)',
-        r'\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n'
-        r'\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif\n',
-        s, count=1
-    )
-    s = re.sub(
-        r'(SYSCALL_DEFINE2\(fstat64,[\s\S]*?cp_new_stat64\(&stat, statbuf\);\n)',
-        r'\1\n#ifdef CONFIG_KSU_MANUAL_HOOK\n'
-        r'\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif\n',
-        s, count=1
-    )
-    return s
-
-def patch_exec(s):
-    if "ksu_handle_post_execveat" in s:
-        return s
-    ext = (
-        "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-        "__attribute__((hot))\n"
-        "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n"
-        "\t\t\t\tvoid *argv, void *envp, int *flags);\n"
-        "__attribute__((hot))\n"
-        "extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr,\n"
-        "\t\t\t\tvoid *argv, void *envp, int *flags, int *retval);\n"
-        "#endif\n\n"
-    )
-    s = re.sub(
-        r'(static int do_execveat_common\(int fd, struct filename \*filename,)',
-        ext + r'\1', s, count=1
-    )
-    s = re.sub(
-        r'(static int do_execveat_common\([\s\S]*?)(\tif \(IS_ERR\(filename\)\))',
-        r'\1#ifdef CONFIG_KSU_MANUAL_HOOK\n'
-        r'\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n'
-        r'#endif\n\n\2',
-        s, count=1
-    )
-    s = re.sub(
-        r'(static int do_execveat_common\([\s\S]*?out_ret:\n)',
-        r'\1#ifdef CONFIG_KSU_MANUAL_HOOK\n'
-        r'\tksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);\n'
-        r'#endif\n',
-        s, count=1
-    )
-    return s
-
-def patch_open(s):
-    if "ksu_handle_faccessat" in s:
-        return s
-    ext = (
-        "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-        "__attribute__((hot))\n"
-        "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n"
-        "\t\t\t\tint *mode, int *flags);\n"
-        "#endif\n\n"
-    )
-    return re.sub(
-        r'(SYSCALL_DEFINE3\(faccessat, int, dfd, const char __user \*, filename, int, mode\)\n\{\n)',
-        ext + r'\1#ifdef CONFIG_KSU_MANUAL_HOOK\n'
-        r'\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n',
-        s, count=1
-    )
-
-def patch_reboot(s):
-    if "ksu_handle_sys_reboot" in s:
-        return s
-    ext = (
-        "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
-        "extern int ksu_handle_sys_reboot(int magic1, int magic2, "
-        "unsigned int cmd, void __user **arg);\n"
-        "#endif\n\n"
-    )
-    s = re.sub(r'(SYSCALL_DEFINE4\(reboot,)', ext + r'\1', s, count=1)
-    return re.sub(
-        r'(SYSCALL_DEFINE4\(reboot,[\s\S]*?)(\tif \(!ns_capable\(pid_ns->user_ns, CAP_SYS_BOOT\)\))',
-        r'\1#ifdef CONFIG_KSU_MANUAL_HOOK\n'
-        r'\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n\2',
-        s, count=1
-    )
-
-patch_file("fs/stat.c", patch_stat)
-patch_file("fs/exec.c", patch_exec)
-patch_file("fs/open.c", patch_open)
-patch_file("kernel/reboot.c", patch_reboot)
-EOF
+    success "SUSFS manually integrated (version: ${SUSFS_VERSION:-unknown})"
 }
 
 integrate_nomount_manual() {
-    log "Applying NoMount"
+    local nomount_repo="https://github.com/maxsteeel/nomount.git"
+    local nomount_branch="${NOMOUNT_BRANCH:-dev}"
+    local kroot="."
+    [ -d "common/fs" ] && kroot="common"
 
-    rm -rf "$WORKDIR/nomount"
-    git clone -q --depth=1 -b dev https://github.com/maxsteeel/nomount.git "$WORKDIR/nomount"
+    log "Cleaning previous NoMount integration..."
+    rm -rf "$WORKDIR/nomount" "$kroot/fs/nomount"
+    sed -i '/CONFIG_NOMOUNT/d' "$kroot/fs/Makefile" 2>/dev/null || true
 
-    if ! grep -q 'source "fs/nomount/Kconfig"' ./fs/Kconfig; then
-        sed -i '/endmenu/i source "fs/nomount/Kconfig"' ./fs/Kconfig
+    log "Cloning NoMount ($nomount_branch)..."
+    git clone -q --depth=1 -b "$nomount_branch" "$nomount_repo" "$WORKDIR/nomount"
+
+    if [ ! -d "$WORKDIR/nomount/kernel/src" ]; then
+        error "NoMount kernel/src directory not found!"
+        return 1
     fi
 
-    if ! grep -q 'CONFIG_NOMOUNT' ./fs/Makefile; then
-        echo 'obj-$(CONFIG_NOMOUNT) += nomount/' >> ./fs/Makefile
+    log "Manually wiring NoMount into $kroot/fs/nomount..."
+    mkdir -p "$kroot/fs/nomount"
+    cp -rf "$WORKDIR/nomount/kernel/src/"* "$kroot/fs/nomount/"
+
+    insert_kconfig_source "$kroot/fs/Kconfig" 'source "fs/nomount/Kconfig"'
+
+    if ! grep -q 'CONFIG_NOMOUNT' "$kroot/fs/Makefile"; then
+        printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> "$kroot/fs/Makefile"
     fi
 
-    mkdir -p ./fs/nomount
-    cp -f "$WORKDIR/nomount/kernel/src/"* ./fs/nomount/
+    success "NoMount manually integrated ($nomount_branch)"
 }
