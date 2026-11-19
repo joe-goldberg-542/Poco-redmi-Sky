@@ -12,8 +12,6 @@ KERNEL_DEFCONFIG="gki_defconfig"
 KERNEL_VERSION="6.6"
 ANDROID_RELEASE="15"
 
-FINASU_BRANCH="${FINASU_BRANCH:-dev}"
-NOMOUNT_BRANCH="${NOMOUNT_BRANCH:-dev}"
 KSU_HOOK="${KSU_HOOK:-tracepoint}"
 
 KSU_EXPECTED_SIZE2="${KSU_EXPECTED_SIZE2:-0x02cc}"
@@ -35,6 +33,14 @@ source "$WORKDIR/functions.sh"
 
 IFS='|' read -r KERNEL_REPO KERNEL_BRANCH KERNEL_KMI <<< "$(resolve_kernel_source)"
 
+SUSFS_URL="https://gitlab.com/simonpunk/susfs4ksu"
+SUSFS_DIR="$WORKDIR/susfs"
+SUSFS_PATCHES="${SUSFS_DIR}/kernel_patches"
+
+FINASU_BRANCH="$(resolve_git_branch "https://github.com/LyraVoid/FinaSU.git" "${FINASU_BRANCH:-dev}" "master")"
+SUSFS_BRANCH="$(resolve_git_branch "$SUSFS_URL" "${SUSFS_BRANCH:-$(resolve_susfs_branch)}" "gki-android15-6.6")"
+NOMOUNT_BRANCH="$(resolve_git_branch "https://github.com/maxsteeel/nomount.git" "${NOMOUNT_BRANCH:-dev}" "master")"
+
 echo "KERNEL_VERSION=$KERNEL_VERSION" >> "$GITHUB_ENV"
 echo "ANDROID_RELEASE=$ANDROID_RELEASE" >> "$GITHUB_ENV"
 echo "KERNEL_SOURCE_REPO=$(simplify_gh_url "$KERNEL_REPO")" >> "$GITHUB_ENV"
@@ -52,6 +58,8 @@ trap 'echo "SCRIPT EXIT at $(date)" >> "$BUILD_LOGS"' EXIT
 trap 'echo "[-] ERROR at line $LINENO: [[$BASH_COMMAND]]" >> "$BUILD_LOGS"' ERR
 trap 'echo "[-] Received SIGTERM at $(date) - possible GitHub kill" >> "$BUILD_LOGS"' TERM
 trap 'echo "[-] Received SIGINT at $(date)" >> "$BUILD_LOGS"' INT
+
+log "Resolved branches -> FinaSU: $FINASU_BRANCH | SUSFS: $SUSFS_BRANCH | NoMount: $NOMOUNT_BRANCH"
 
 log "Cloning kernel source from $(simplify_gh_url "$KERNEL_REPO")"
 git clone -q --depth=1 "$KERNEL_REPO" -b "$KERNEL_BRANCH" "$KSRC"
@@ -77,12 +85,6 @@ if [ "$KSU" = "KSU" ] && susfs_included; then
     VARIANT+="+Inline"
   fi
 fi
-
-SUSFS_URL="https://gitlab.com/simonpunk/susfs4ksu"
-SUSFS_DIR="$WORKDIR/susfs"
-SUSFS_PATCHES="${SUSFS_DIR}/kernel_patches"
-
-SUSFS_BRANCH="${SUSFS_BRANCH:-$(resolve_susfs_branch)}"
 
 log "Changelog of repos"
 clone_susfs 5
@@ -504,6 +506,8 @@ on property:sys.boot_completed=1
     write /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 499200
 
 on property:vendor.post_boot.parsed=1
+    write /proc/sys/vm/swappiness 60
+    write /proc/sys/vm/vfs_cache_pressure 100
     write /proc/sys/net/core/default_qdisc fq
     write /proc/sys/net/ipv4/tcp_congestion_control bbr
     write /sys/block/sda/queue/scheduler kyber
