@@ -8,6 +8,19 @@ resolve_susfs_branch() {
   echo "gki-android15-6.6-dev"
 }
 
+resolve_git_branch() {
+  local repo="$1"
+  local preferred="$2"
+  local fallback="$3"
+
+  if command git ls-remote --exit-code --heads "$repo" "$preferred" >/dev/null 2>&1; then
+    echo "$preferred"
+  else
+    warning "Branch '$preferred' not found in $repo, falling back to '$fallback'" >&2
+    echo "$fallback"
+  fi
+}
+
 susfs_included() {
   [ "$KSU_SUSFS" == "true" ]
   return $?
@@ -226,6 +239,7 @@ apply_kyber_default_patch() {
 
     log "Patching $elevator_file to set kyber as default I/O scheduler..."
     python3 - "$elevator_file" << 'EOF'
+import re
 import sys
 from pathlib import Path
 
@@ -235,27 +249,36 @@ src = path.read_text()
 if 'elevator_find_get(q, "kyber")' in src:
     sys.exit(0)
 
-target = 'return elevator_find_get(q, "mq-deadline");'
-replacement = (
-    '{\n'
-    '\t\tstruct elevator_type *e = elevator_find_get(q, "kyber");\n'
-    '\t\tif (e)\n'
-    '\t\t\treturn e;\n'
-    '\t\treturn elevator_find_get(q, "mq-deadline");\n'
-    '\t}'
+pattern = re.compile(
+    r'(elevator_get_default\s*\([^)]*\)\s*\{[\s\S]*?)'
+    r'return\s+elevator_find_get\s*\(\s*q\s*,\s*"([^"]+)"\s*\)\s*;'
 )
 
-if target not in src:
-    raise SystemExit("[-] Could not find mq-deadline default in block/elevator.c")
+def repl(m):
+    fallback = m.group(2)
+    return (
+        m.group(1)
+        + '{\n'
+        + '\t\tstruct elevator_type *e = elevator_find_get(q, "kyber");\n'
+        + '\t\tif (e)\n'
+        + '\t\t\treturn e;\n'
+        + f'\t\treturn elevator_find_get(q, "{fallback}");\n'
+        + '\t}'
+    )
 
-path.write_text(src.replace(target, replacement, 1))
+updated, count = pattern.subn(repl, src, count=1)
+if count == 0:
+    raise SystemExit("[-] Could not find default elevator in elevator_get_default()")
+
+path.write_text(updated)
 EOF
     success "Default kernel I/O scheduler patched to kyber"
 }
 
 integrate_finasu_manual() {
     local finasu_repo="https://github.com/LyraVoid/FinaSU.git"
-    local finasu_branch="${FINASU_BRANCH:-dev}"
+    local finasu_branch
+    finasu_branch="$(resolve_git_branch "$finasu_repo" "${FINASU_BRANCH:-dev}" "master")"
     local driver_dir="drivers"
     local symlink_target="../FinaSU/kernel"
 
@@ -288,7 +311,7 @@ integrate_finasu_manual() {
 
     local finasu_ver
     finasu_ver=$(command git -C ./FinaSU describe --tags --always 2>/dev/null || command git -C ./FinaSU rev-parse --short HEAD)
-    success "FinaSU manually integrated (${finasu_ver})"
+    success "FinaSU manually integrated (${finasu_ver} @ ${finasu_branch})"
 }
 
 clone_susfs() {
@@ -325,6 +348,7 @@ apply_susfs_manual() {
         cd "$kroot" || exit 1
         patch -p1 --forward --fuzz=3 < "$patch_name"
     )
+    rm -f "$kroot/$patch_name"
 
     if ! grep -q 'CFLAGS_susfs.o' "$kroot/fs/Makefile"; then
         printf '\nCFLAGS_susfs.o += -Wno-unused-function\n' >> "$kroot/fs/Makefile"
@@ -345,7 +369,8 @@ apply_susfs_manual() {
 
 integrate_nomount_manual() {
     local nomount_repo="https://github.com/maxsteeel/nomount.git"
-    local nomount_branch="${NOMOUNT_BRANCH:-dev}"
+    local nomount_branch
+    nomount_branch="$(resolve_git_branch "$nomount_repo" "${NOMOUNT_BRANCH:-dev}" "master")"
     local kroot="."
     [ -d "common/fs" ] && kroot="common"
 
