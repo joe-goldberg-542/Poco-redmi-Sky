@@ -140,7 +140,7 @@ jobs:
       - name: Package Boot Image
         if: github.event.inputs.TODO != 'defconfig' && github.event.inputs.TEST == 'no'
         env:
-          BOOT_IMG_URL: "https://www.dropbox.com/scl/fi/urvcvox1os6tjpt6btg96/Aospaboot.img?rlkey=ivf9hkuluneilz6bblbnqfce6&st=f9nj6nep&dl=1"
+          BOOT_IMG_URL: "https://www.dropbox.com/scl/fi/r24xi3y1k2q3tzjz590v2/boot.img?rlkey=q98xqc3dmbmmkgfm1opd01mkm&st=i04u9vo3&dl=1"
         shell: bash
         run: |
           echo "::group::[*] Packaging Boot Image"
