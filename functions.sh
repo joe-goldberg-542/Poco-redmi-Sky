@@ -227,54 +227,6 @@ build_and_install_pahole() {
     return 0
 }
 
-apply_kyber_default_patch() {
-    local kroot="."
-    [ -d "common/block" ] && kroot="common"
-    local elevator_file="$kroot/block/elevator.c"
-
-    if [ ! -f "$elevator_file" ]; then
-        error "Missing $elevator_file"
-        return 1
-    fi
-
-    log "Patching $elevator_file to set kyber as default I/O scheduler..."
-    python3 - "$elevator_file" << 'EOF'
-import re
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-src = path.read_text()
-
-if 'elevator_find_get(q, "kyber")' in src:
-    sys.exit(0)
-
-pattern = re.compile(
-    r'(elevator_get_default\s*\([^)]*\)\s*\{[\s\S]*?)'
-    r'return\s+elevator_find_get\s*\(\s*q\s*,\s*"([^"]+)"\s*\)\s*;'
-)
-
-def repl(m):
-    fallback = m.group(2)
-    return (
-        m.group(1)
-        + '{\n'
-        + '\t\tstruct elevator_type *e = elevator_find_get(q, "kyber");\n'
-        + '\t\tif (e)\n'
-        + '\t\t\treturn e;\n'
-        + f'\t\treturn elevator_find_get(q, "{fallback}");\n'
-        + '\t}'
-    )
-
-updated, count = pattern.subn(repl, src, count=1)
-if count == 0:
-    raise SystemExit("[-] Could not find default elevator in elevator_get_default()")
-
-path.write_text(updated)
-EOF
-    success "Default kernel I/O scheduler patched to kyber"
-}
-
 integrate_finasu_manual() {
     local finasu_repo="https://github.com/LyraVoid/FinaSU.git"
     local finasu_branch
