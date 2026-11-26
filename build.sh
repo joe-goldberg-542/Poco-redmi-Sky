@@ -124,12 +124,10 @@ echo "::group::[+] pahole installation"
 build_and_install_pahole
 echo "::endgroup::"
 
-echo "::group::[+] Manual integrations (FinaSU / SUSFS / NoMount / Kyber)"
+echo "::group::[+] Manual integrations (FinaSU / SUSFS / NoMount)"
 
 export DROIDSPACES="false"
 export NH="false"
-
-apply_kyber_default_patch
 
 if [ "$KSU" = "KSU" ]; then
   integrate_finasu_manual
@@ -165,7 +163,6 @@ CONFIG_DEFAULT_TCP_CONG="bbr"
 CONFIG_NET_SCHED=y
 CONFIG_NET_SCH_FQ=y
 CONFIG_NET_SCH_FQ_CODEL=y
-CONFIG_MQ_IOSCHED_KYBER=y
 EOF
 
 if [ "$KSU" != "no" ] && [ "$KSU" != "vnlto" ]; then
@@ -279,8 +276,7 @@ fi
   --set-str DEFAULT_TCP_CONG "bbr" \
   -e NET_SCHED \
   -e NET_SCH_FQ \
-  -e NET_SCH_FQ_CODEL \
-  -e MQ_IOSCHED_KYBER
+  -e NET_SCH_FQ_CODEL
 
 if [ "$KSU" != "no" ] && [ "$KSU" != "vnlto" ]; then
   ./scripts/config --file "$OUTDIR/.config" \
@@ -321,16 +317,9 @@ if [ "$NM" = "true" ]; then
   ./scripts/config --file "$OUTDIR/.config" -e NOMOUNT
 fi
 
-log "Configuring governor, zRAM, and localversion"
+log "Configuring localversion"
 LATEST_COMMIT_HASH=$(git rev-parse --short=12 HEAD)
 ./scripts/config --file "$OUTDIR/.config" \
-  -e CPU_FREQ_GOV_SCHEDUTIL \
-  -e CPU_FREQ_DEFAULT_GOV_SCHEDUTIL \
-  -d CPU_FREQ_DEFAULT_GOV_PERFORMANCE \
-  -d CPU_FREQ_DEFAULT_GOV_POWERSAVE \
-  -d CPU_FREQ_DEFAULT_GOV_WALT \
-  -e CRYPTO_LZ4 \
-  --set-str ZRAM_DEF_COMP "lz4" \
   --set-str CONFIG_LOCALVERSION "-android15-11-g${LATEST_COMMIT_HASH}" \
   -d CONFIG_LOCALVERSION_AUTO
 
@@ -363,12 +352,12 @@ esac
 
 make "${MAKE_ARGS[@]}" olddefconfig > /dev/null
 
-log "Checking .config for LTO, BBR, and Kyber"
+log "Checking .config for LTO and BBR"
 grep "CONFIG_LTO" "$OUTDIR/.config" || true
-grep -E '^CONFIG_(TCP_CONG_BBR|DEFAULT_BBR|DEFAULT_TCP_CONG|NET_SCH_FQ|MQ_IOSCHED_KYBER)=' "$OUTDIR/.config" || true
+grep -E '^CONFIG_(TCP_CONG_BBR|DEFAULT_BBR|DEFAULT_TCP_CONG|NET_SCH_FQ)=' "$OUTDIR/.config" || true
 echo "::endgroup::"
 
-for opt in CONFIG_TCP_CONG_BBR CONFIG_NET_SCH_FQ CONFIG_MQ_IOSCHED_KYBER; do
+for opt in CONFIG_TCP_CONG_BBR CONFIG_NET_SCH_FQ; do
   if ! grep -q "^${opt}=y$" "$OUTDIR/.config"; then
     error "Required tuning option missing in .config: ${opt}=y"
     exit 1
@@ -481,48 +470,12 @@ sed -i \
   "$WORKDIR/anykernel/anykernel.sh"
 
 cd anykernel
-log "Zipping anykernel and creating init.special.rc"
+log "Zipping anykernel"
 if [ ! -f "$KERNEL_IMAGE" ]; then
   error "$KERNEL_IMAGE not found."
   exit 1
 fi
 cp "$KERNEL_IMAGE" .
-
-mkdir -p overlay.d
-cat << 'EOF' > overlay.d/init.special.rc
-on property:sys.boot_completed=1
-    write /proc/sys/vm/swappiness 60
-    write /proc/sys/vm/vfs_cache_pressure 100
-    write /proc/sys/net/core/default_qdisc fq
-    write /proc/sys/net/ipv4/tcp_congestion_control bbr
-    write /sys/block/sda/queue/scheduler kyber
-    write /sys/block/sdb/queue/scheduler kyber
-    write /sys/block/sdc/queue/scheduler kyber
-    write /sys/block/sdd/queue/scheduler kyber
-    write /sys/block/sde/queue/scheduler kyber
-    write /sys/block/sdf/queue/scheduler kyber
-    write /sys/block/mmcblk0/queue/scheduler kyber
-    write /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq 499200
-    write /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 499200
-
-on property:vendor.post_boot.parsed=1
-    write /proc/sys/vm/swappiness 60
-    write /proc/sys/vm/vfs_cache_pressure 100
-    write /proc/sys/net/core/default_qdisc fq
-    write /proc/sys/net/ipv4/tcp_congestion_control bbr
-    write /sys/block/sda/queue/scheduler kyber
-    write /sys/block/sdb/queue/scheduler kyber
-    write /sys/block/sdc/queue/scheduler kyber
-    write /sys/block/sdd/queue/scheduler kyber
-    write /sys/block/sde/queue/scheduler kyber
-    write /sys/block/sdf/queue/scheduler kyber
-    write /sys/block/mmcblk0/queue/scheduler kyber
-    write /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq 499200
-    write /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 499200
-EOF
-
-sed -i '/write_boot;/i \
-insert_line init.rc "init.special.rc" after "import /init.environ.rc" "import /init.special.rc";' anykernel.sh
 
 zip -r9 "$WORKDIR/$AK3_ZIP_NAME" ./*
 cd "$WORKDIR"
